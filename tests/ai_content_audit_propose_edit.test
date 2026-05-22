@@ -1,0 +1,364 @@
+<?php
+
+/**
+ * @file
+ * Smoke tests for the propose-edit path of ai_content_audit.
+ *
+ * The reject/unwind tests construct before_state by hand. These tests prove
+ * the OTHER side of the contract: that ai_content_audit_execute_propose_edit()
+ * actually writes the before_state shape that the reject code reads. Without
+ * this coverage, propose could silently store the wrong pointers and the
+ * reject tests would still pass against synthetic data.
+ *
+ * Also covers the propose-then-reject round trip, which is what an end user
+ * actually does: AI agent proposes an edit, admin rejects it, live site is
+ * supposed to be in the same state it started in.
+ */
+
+class AIContentAuditProposeEditTestCase extends BackdropWebTestCase {
+
+  /**
+   * Backdrop testbot description.
+   */
+  public static function getInfo() {
+    return [
+      'name' => 'AI Content Audit propose-edit smoke',
+      'description' => 'Verifies audit_propose_edit creates a draft revision and writes a before_state shape the reject path can consume — including a full propose-then-reject round trip on a paragraph-backed field.',
+      'group' => 'AI Content Audit',
+    ];
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function setUp() {
+    parent::setUp(['ai', 'ai_content_audit', 'paragraphs']);
+    module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.tools');
+
+    $this->backdropCreateContentType(['type' => 'post', 'name' => 'Post']);
+    $this->backdropCreateContentType(['type' => 'paragraph_host', 'name' => 'Paragraph Host']);
+    $this->createParagraphBundle();
+    $this->createParagraphField();
+
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fixture builders.
+  // ---------------------------------------------------------------------------
+
+  protected function createParagraphBundle() {
+    $type = new StdClass();
+    $type->bundle = 'ptest';
+    $type->name = 'PTest';
+    $type->label = 'PTest';
+    $type->description = 'Test paragraph bundle.';
+    $type->locked = 1;
+    $type->allow_unpublish = 0;
+    paragraphs_bundle_save($type);
+  }
+
+  protected function createParagraphField() {
+    field_create_field([
+      'field_name' => 'field_paragraphs',
+      'type' => 'paragraphs',
+      'cardinality' => 5,
+      'settings' => [],
+    ]);
+    field_create_instance([
+      'field_name' => 'field_paragraphs',
+      'entity_type' => 'node',
+      'bundle' => 'paragraph_host',
+      'label' => 'Paragraphs',
+      'required' => 0,
+      'settings' => ['allowed_bundles' => ['ptest' => 'ptest']],
+      'widget' => ['type' => 'paragraphs_embed', 'settings' => []],
+    ]);
+    field_create_field([
+      'field_name' => 'field_ptest_text',
+      'type' => 'text_long',
+      'cardinality' => 1,
+      'settings' => [],
+    ]);
+    field_create_instance([
+      'field_name' => 'field_ptest_text',
+      'entity_type' => 'paragraphs_item',
+      'bundle' => 'ptest',
+      'label' => 'Text',
+      'required' => 0,
+      'settings' => [],
+      'widget' => ['type' => 'text_textarea', 'settings' => []],
+    ]);
+  }
+
+  /**
+   * Build a basic 'post' node with body + return [nid, vid].
+   */
+  protected function createPostNode($title = 'Original title', $body = 'Original body text.') {
+    $node = new Node([
+      'type' => 'post',
+      'title' => $title,
+      'uid' => 1,
+      'status' => 1,
+      'body' => [LANGUAGE_NONE => [['value' => $body, 'format' => 'plain_text']]],
+    ]);
+    node_save($node);
+    return ['nid' => (int) $node->nid, 'vid' => (int) $node->vid];
+  }
+
+  /**
+   * Build a paragraph_host node with one ptest paragraph.
+   */
+  protected function createHostNodeWithParagraph($text = 'Original paragraph text.') {
+    $paragraph = entity_create('paragraphs_item', [
+      'bundle' => 'ptest',
+      'field_name' => 'field_paragraphs',
+    ]);
+    $paragraph->field_ptest_text[LANGUAGE_NONE][0] = ['value' => $text, 'format' => 'plain_text'];
+
+    $node = new Node([
+      'type' => 'paragraph_host',
+      'title' => 'Host node',
+      'uid' => 1,
+      'status' => 1,
+    ]);
+    $node->field_paragraphs[LANGUAGE_NONE][0] = ['entity' => $paragraph];
+    node_save($node);
+
+    $previous_paragraph_revision_id = (int) db_query('SELECT revision_id FROM {paragraphs_item} WHERE item_id = :id', [':id' => $paragraph->item_id])->fetchField();
+
+    return [
+      'nid' => (int) $node->nid,
+      'original_vid' => (int) $node->vid,
+      'paragraph_item_id' => (int) $paragraph->item_id,
+      'previous_paragraph_revision_id' => $previous_paragraph_revision_id,
+    ];
+  }
+
+  /**
+   * Insert a canonical candidate row so propose_edit has a target acid.
+   * Returns acid.
+   */
+  protected function createCanonicalCandidate($nid) {
+    $cid = db_insert('ai_content_audit_cluster')
+      ->fields([
+        'run_id' => 'propose-test',
+        'profile' => 'default',
+        'topic_label' => 'Propose target',
+        'canonical_nid' => $nid,
+        'source_count' => 1,
+        'created' => REQUEST_TIME,
+        'updated' => REQUEST_TIME,
+      ])
+      ->execute();
+    return db_insert('ai_content_audit_candidate')
+      ->fields([
+        'cluster_id' => $cid,
+        'run_id' => 'propose-test',
+        'nid' => $nid,
+        'bundle' => '',
+        'title' => 'Canonical row',
+        'task_type' => 'canonical',
+        'is_canonical' => 1,
+        'status' => 'pending',
+        'created' => REQUEST_TIME,
+        'updated' => REQUEST_TIME,
+      ])
+      ->execute();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tests.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Plain node-body edit: must create a draft revision and stash a before_state
+   * the reject path can later consume.
+   */
+  public function testProposeNodeFieldEditCreatesDraftAndBeforeState() {
+    $fx = $this->createPostNode('Original title', 'Original body text.');
+    $acid = $this->createCanonicalCandidate($fx['nid']);
+
+    $result = ai_content_audit_execute_propose_edit([
+      'acid' => $acid,
+      'nid' => $fx['nid'],
+      'proposed_title' => 'Proposed title',
+      'proposed_body' => 'Proposed body content with substantive changes.',
+      'reason' => 'Smoke test edit',
+    ]);
+
+    $this->assertTrue(empty($result['error']), 'propose_edit returned without error: ' . (isset($result['error']) ? $result['error'] : ''));
+    $this->assertEqual($fx['vid'], (int) $result['current_vid'], 'Result current_vid matches original vid.');
+    $this->assertTrue((int) $result['proposed_vid'] > $fx['vid'], 'Result proposed_vid is a new revision id.');
+
+    // A new node revision exists.
+    $revs = db_query('SELECT vid FROM {node_revision} WHERE nid = :n ORDER BY vid', [':n' => $fx['nid']])->fetchCol();
+    $this->assertEqual(2, count($revs), 'Node now has two revisions (original + draft).');
+    $this->assertTrue(in_array((int) $result['proposed_vid'], array_map('intval', $revs)), 'Draft revision id is present in {node_revision}.');
+
+    // Candidate row was rewritten: task_type -> edit_proposed, before_state set.
+    $row = db_query('SELECT task_type, status, before_state, proposed_action_detail FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('edit_proposed', $row['task_type'], 'task_type rewritten to edit_proposed.');
+    $this->assertEqual('pending', $row['status'], 'status set to pending.');
+    $this->assertEqual('Smoke test edit', trim($row['proposed_action_detail']), 'proposed_action_detail stored.');
+
+    $before = json_decode($row['before_state'], TRUE);
+    $this->assertTrue(is_array($before), 'before_state decodes to an array.');
+    $this->assertEqual($fx['vid'], (int) $before['current_vid'], 'before_state.current_vid = original vid.');
+    $this->assertEqual((int) $result['proposed_vid'], (int) $before['proposed_vid'], 'before_state.proposed_vid = new draft vid.');
+    $this->assertEqual('canonical', $before['original_task_type'], 'before_state.original_task_type captured the pre-propose task_type.');
+    $this->assertEqual('pending', $before['original_status'], 'before_state.original_status captured the pre-propose status.');
+    $this->assertEqual(0, (int) $before['paragraph_item_id'], 'paragraph_item_id is 0 for a node-field edit.');
+    $this->assertEqual(0, (int) $before['paragraph_proposed_revision_id'], 'paragraph_proposed_revision_id is 0 for a node-field edit.');
+    $this->assertTrue(!empty($before['target_field']), 'target_field stored.');
+  }
+
+  /**
+   * Paragraph-field edit: must create a new paragraph revision AND a new node
+   * revision, and stash all the paragraph pointers in before_state.
+   */
+  public function testProposeParagraphEditCreatesDraftAndBeforeState() {
+    $fx = $this->createHostNodeWithParagraph('Original paragraph text.');
+    $acid = $this->createCanonicalCandidate($fx['nid']);
+
+    // Build a target_context the way audit_get_node_content would have.
+    $target_context = [
+      'target_type' => 'paragraph_field',
+      'host_field' => 'field_paragraphs',
+      'host_langcode' => LANGUAGE_NONE,
+      'delta' => 0,
+      'item_id' => $fx['paragraph_item_id'],
+      'revision_id' => $fx['previous_paragraph_revision_id'],
+      'paragraph_bundle' => 'ptest',
+      'field_name' => 'field_ptest_text',
+      'value' => 'Original paragraph text.',
+    ];
+
+    $result = ai_content_audit_execute_propose_edit([
+      'acid' => $acid,
+      'nid' => $fx['nid'],
+      'target_context' => $target_context,
+      'proposed_body' => 'AI-proposed paragraph text with new information.',
+      'reason' => 'Paragraph smoke test',
+    ]);
+
+    $this->assertTrue(empty($result['error']), 'propose_edit returned without error: ' . (isset($result['error']) ? $result['error'] : ''));
+    $proposed_vid = (int) $result['proposed_vid'];
+    $this->assertTrue($proposed_vid > $fx['original_vid'], 'New node draft revision was created.');
+
+    // A new paragraph revision exists.
+    $all_paragraph_revs = db_query('SELECT revision_id FROM {paragraphs_item_revision} WHERE item_id = :id ORDER BY revision_id', [':id' => $fx['paragraph_item_id']])->fetchCol();
+    $this->assertEqual(2, count($all_paragraph_revs), 'Paragraph now has two revisions (original + proposed).');
+    $proposed_paragraph_rev = (int) end($all_paragraph_revs);
+    $this->assertTrue($proposed_paragraph_rev > $fx['previous_paragraph_revision_id'], 'Proposed paragraph rev id is greater than previous.');
+
+    // before_state should contain the paragraph pointers the reject code reads.
+    $row = db_query('SELECT task_type, before_state FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('edit_proposed', $row['task_type'], 'task_type rewritten to edit_proposed.');
+
+    $before = json_decode($row['before_state'], TRUE);
+    $this->assertEqual($fx['paragraph_item_id'], (int) $before['paragraph_item_id'], 'before_state.paragraph_item_id matches fixture.');
+    $this->assertEqual($fx['previous_paragraph_revision_id'], (int) $before['paragraph_previous_revision_id'], 'before_state.paragraph_previous_revision_id matches fixture.');
+    $this->assertEqual($proposed_paragraph_rev, (int) $before['paragraph_proposed_revision_id'], 'before_state.paragraph_proposed_revision_id = newly created paragraph rev.');
+    $this->assertEqual('paragraph_field', $before['target_context']['target_type'], 'target_context.target_type preserved.');
+    $this->assertEqual('field_ptest_text', $before['target_field'], 'target_field is the paragraph text field.');
+    $this->assertEqual('canonical', $before['original_task_type'], 'original_task_type captured.');
+  }
+
+  /**
+   * The killer test: propose then reject. End state on a paragraph edit must
+   * exactly equal the pre-propose state — same node default vid, same
+   * paragraph default revision, no orphan paragraph revisions, candidate row
+   * back to its original task_type.
+   */
+  public function testProposeThenRejectRoundTrip() {
+    $fx = $this->createHostNodeWithParagraph('Original paragraph text.');
+    $acid = $this->createCanonicalCandidate($fx['nid']);
+
+    $target_context = [
+      'target_type' => 'paragraph_field',
+      'host_field' => 'field_paragraphs',
+      'host_langcode' => LANGUAGE_NONE,
+      'delta' => 0,
+      'item_id' => $fx['paragraph_item_id'],
+      'revision_id' => $fx['previous_paragraph_revision_id'],
+      'paragraph_bundle' => 'ptest',
+      'field_name' => 'field_ptest_text',
+      'value' => 'Original paragraph text.',
+    ];
+
+    $result = ai_content_audit_execute_propose_edit([
+      'acid' => $acid,
+      'nid' => $fx['nid'],
+      'target_context' => $target_context,
+      'proposed_body' => 'AI-proposed paragraph text with new information.',
+      'reason' => 'Round trip',
+    ]);
+    $this->assertTrue(empty($result['error']), 'Propose phase succeeded.');
+    $proposed_vid = (int) $result['proposed_vid'];
+
+    // Detach the proposed node vid so node_revision_delete() will accept it,
+    // mirroring what draft_workflow would normally do for us in production.
+    db_update('node')->fields(['vid' => $fx['original_vid']])->condition('nid', $fx['nid'])->execute();
+    entity_get_controller('node')->resetCache([$fx['nid']]);
+
+    // Now reject.
+    ai_content_audit_update_candidate_status([$acid], 'rejected', 1);
+
+    // End state should exactly equal pre-propose state.
+    $end_node_vid = (int) db_query('SELECT vid FROM {node} WHERE nid = :n', [':n' => $fx['nid']])->fetchField();
+    $this->assertEqual($fx['original_vid'], $end_node_vid, 'Node default vid is back to original.');
+
+    $end_paragraph_rev = (int) db_query('SELECT revision_id FROM {paragraphs_item} WHERE item_id = :id', [':id' => $fx['paragraph_item_id']])->fetchField();
+    $this->assertEqual($fx['previous_paragraph_revision_id'], $end_paragraph_rev, 'Paragraph default rev is back to original.');
+
+    $proposed_node_rev_count = (int) db_query('SELECT COUNT(*) FROM {node_revision} WHERE vid = :v', [':v' => $proposed_vid])->fetchField();
+    $this->assertEqual(0, $proposed_node_rev_count, 'Proposed node revision deleted.');
+
+    $orphan_paragraph_count = (int) db_query(
+      'SELECT COUNT(*) FROM {paragraphs_item_revision} WHERE item_id = :id AND revision_id > :prev',
+      [':id' => $fx['paragraph_item_id'], ':prev' => $fx['previous_paragraph_revision_id']]
+    )->fetchField();
+    $this->assertEqual(0, $orphan_paragraph_count, 'No orphan paragraph revisions remain.');
+
+    // Candidate row back to canonical/pending.
+    $row = db_query('SELECT task_type, status, before_state FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('canonical', $row['task_type'], 'task_type restored to canonical after reject.');
+    $this->assertEqual('pending', $row['status'], 'status restored to pending after reject (not rejected).');
+    $this->assertTrue($row['before_state'] === NULL || $row['before_state'] === '', 'before_state cleared after reject.');
+
+    // archived flag must NOT be set — that would tell paragraphs the item is
+    // gone, even though it still has the live revision.
+    $archived = (int) db_query('SELECT archived FROM {paragraphs_item} WHERE item_id = :id', [':id' => $fx['paragraph_item_id']])->fetchField();
+    $this->assertEqual(0, $archived, 'paragraphs_item.archived left at 0 after reject.');
+  }
+
+  /**
+   * Cosmetic-only / no-op proposals must be rejected at the propose step so
+   * they never create dangling node or paragraph revisions.
+   */
+  public function testProposeNoOpReturnsError() {
+    $fx = $this->createPostNode('Same title', 'Same body.');
+    $acid = $this->createCanonicalCandidate($fx['nid']);
+
+    $result = ai_content_audit_execute_propose_edit([
+      'acid' => $acid,
+      'nid' => $fx['nid'],
+      'proposed_title' => 'Same title',
+      'proposed_body' => 'Same body.',
+      'reason' => 'No-op proposal',
+    ]);
+
+    $this->assertTrue(!empty($result['error']), 'propose_edit refused a no-op proposal.');
+    $this->assertTrue(strpos($result['error'], 'No meaningful content change') !== FALSE, 'Error message identifies no-op.');
+
+    // No new node revision was created.
+    $rev_count = (int) db_query('SELECT COUNT(*) FROM {node_revision} WHERE nid = :n', [':n' => $fx['nid']])->fetchField();
+    $this->assertEqual(1, $rev_count, 'No-op proposal did not create a draft revision.');
+
+    // Candidate row untouched.
+    $row = db_query('SELECT task_type, status, before_state FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('canonical', $row['task_type'], 'Candidate task_type unchanged after no-op.');
+    $this->assertEqual('pending', $row['status'], 'Candidate status unchanged after no-op.');
+    $this->assertTrue($row['before_state'] === NULL || $row['before_state'] === '', 'before_state not written for no-op.');
+  }
+}

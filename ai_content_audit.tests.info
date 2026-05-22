@@ -1,0 +1,17 @@
+[AIContentAuditRejectUnwindTestCase]
+name = AI Content Audit reject/unwind
+description = Verify that rejecting a candidate restores prior task_type, clears before_state, and deletes proposed node revisions.
+group = AI Content Audit
+file = tests/ai_content_audit_reject_unwind.test
+
+[AIContentAuditParagraphUnwindTestCase]
+name = AI Content Audit paragraph unwind
+description = Verify paragraph-revision unwinding (repoint + delete) when rejecting an edit_proposed candidate that targeted a paragraph field.
+group = AI Content Audit
+file = tests/ai_content_audit_paragraph_unwind.test
+
+[AIContentAuditProposeEditTestCase]
+name = AI Content Audit propose-edit smoke
+description = Verify audit_propose_edit creates a draft revision and writes a before_state shape the reject path can consume, including a full propose-then-reject round trip on a paragraph-backed field.
+group = AI Content Audit
+file = tests/ai_content_audit_propose_edit.test

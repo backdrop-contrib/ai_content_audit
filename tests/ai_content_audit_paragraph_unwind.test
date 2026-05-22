@@ -1,0 +1,323 @@
+<?php
+
+/**
+ * @file
+ * Tests for ai_content_audit reject/unwind of paragraph-backed proposed edits.
+ *
+ * Paragraphs do not have draft-workflow support, so ai_content_audit emulates
+ * one in its reject path: when a proposed edit targeted a paragraph field, the
+ * unwind has to (a) delete the proposed node revision, (b) optionally
+ * re-point paragraphs_item.revision_id back to the previous paragraph
+ * revision, and (c) delete the orphan paragraph revision. This is the most
+ * failure-prone branch in the module — a bug here can render AI-generated
+ * text the admin explicitly rejected.
+ */
+
+class AIContentAuditParagraphUnwindTestCase extends BackdropWebTestCase {
+
+  /**
+   * Backdrop testbot description.
+   */
+  public static function getInfo() {
+    return [
+      'name' => 'AI Content Audit paragraph unwind',
+      'description' => 'Verifies paragraph-revision unwinding when rejecting an edit_proposed candidate that targeted a paragraph field.',
+      'group' => 'AI Content Audit',
+    ];
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function setUp() {
+    parent::setUp(['ai', 'ai_content_audit', 'paragraphs']);
+    $this->backdropCreateContentType(['type' => 'paragraph_host', 'name' => 'Paragraph Host']);
+    $this->createParagraphBundle();
+    $this->createParagraphField();
+  }
+
+  /**
+   * Create the ptest paragraph bundle.
+   */
+  protected function createParagraphBundle() {
+    $type = new StdClass();
+    $type->bundle = 'ptest';
+    $type->name = 'PTest';
+    $type->label = 'PTest';
+    $type->description = 'Test paragraph bundle.';
+    $type->locked = 1;
+    $type->allow_unpublish = 0;
+    paragraphs_bundle_save($type);
+  }
+
+  /**
+   * Attach a paragraph reference field to the host content type and a text
+   * field to the paragraph bundle.
+   */
+  protected function createParagraphField() {
+    field_create_field([
+      'field_name' => 'field_paragraphs',
+      'type' => 'paragraphs',
+      'cardinality' => 5,
+      'settings' => [],
+    ]);
+    field_create_instance([
+      'field_name' => 'field_paragraphs',
+      'entity_type' => 'node',
+      'bundle' => 'paragraph_host',
+      'label' => 'Paragraphs',
+      'required' => 0,
+      'settings' => ['allowed_bundles' => ['ptest' => 'ptest']],
+      'widget' => ['type' => 'paragraphs_embed', 'settings' => []],
+    ]);
+
+    field_create_field([
+      'field_name' => 'field_ptest_text',
+      'type' => 'text_long',
+      'cardinality' => 1,
+      'settings' => [],
+    ]);
+    field_create_instance([
+      'field_name' => 'field_ptest_text',
+      'entity_type' => 'paragraphs_item',
+      'bundle' => 'ptest',
+      'label' => 'Text',
+      'required' => 0,
+      'settings' => [],
+      'widget' => ['type' => 'text_textarea', 'settings' => []],
+    ]);
+  }
+
+  /**
+   * Build a host node with one ptest paragraph and return identifiers.
+   *
+   * @return array
+   *   ['nid' => int, 'original_vid' => int, 'paragraph_item_id' => int,
+   *    'previous_paragraph_revision_id' => int]
+   */
+  protected function createHostNodeWithParagraph($text = 'Original paragraph text') {
+    $paragraph = entity_create('paragraphs_item', [
+      'bundle' => 'ptest',
+      'field_name' => 'field_paragraphs',
+    ]);
+    $paragraph->field_ptest_text[LANGUAGE_NONE][0] = ['value' => $text, 'format' => 'plain_text'];
+
+    $node = new Node([
+      'type' => 'paragraph_host',
+      'title' => 'Host node',
+      'uid' => 1,
+      'status' => 1,
+    ]);
+    $node->field_paragraphs[LANGUAGE_NONE][0] = ['entity' => $paragraph];
+    node_save($node);
+
+    $previous_paragraph_revision_id = (int) db_query('SELECT revision_id FROM {paragraphs_item} WHERE item_id = :id', [':id' => $paragraph->item_id])->fetchField();
+
+    return [
+      'nid' => $node->nid,
+      'original_vid' => $node->vid,
+      'paragraph_item_id' => (int) $paragraph->item_id,
+      'previous_paragraph_revision_id' => $previous_paragraph_revision_id,
+    ];
+  }
+
+  /**
+   * Save a NEW paragraph revision (which becomes the paragraph's default).
+   *
+   * Mirrors ai_content_audit_set_paragraph_target_value(): the paragraph
+   * doesn't get saved standalone — it gets attached to the host node, and
+   * node_save() triggers paragraphs_field_presave() which saves the new
+   * paragraph revision. Returns the new paragraph revision id.
+   */
+  protected function saveNewParagraphRevision($nid, $new_text) {
+    $node = node_load($nid, NULL, TRUE);
+    $current_rev = (int) $node->field_paragraphs[LANGUAGE_NONE][0]['revision_id'];
+    $paragraph = paragraphs_item_revision_load($current_rev);
+    $paragraph->field_ptest_text[LANGUAGE_NONE][0]['value'] = $new_text;
+    $paragraph->revision = TRUE;
+    $paragraph->is_new_revision = TRUE;
+    $node->field_paragraphs[LANGUAGE_NONE][0] = [
+      'entity' => $paragraph,
+      'value' => $paragraph->item_id,
+      'revision_id' => $paragraph->revision_id,
+    ];
+    $node->revision = TRUE;
+    $node->is_new_revision = TRUE;
+    node_save($node);
+    // Reload to pick up the freshly-assigned paragraph revision_id.
+    entity_get_controller('node')->resetCache([$nid]);
+    $reloaded = node_load($nid, NULL, TRUE);
+    return (int) $reloaded->field_paragraphs[LANGUAGE_NONE][0]['revision_id'];
+  }
+
+  /**
+   * Make the node's current vid non-active so node_revision_delete() can
+   * remove it. Mirrors production's reliance on draft_workflow's
+   * is_active_revision = FALSE.
+   */
+  protected function detachCurrentNodeVid($nid, $previous_vid) {
+    db_update('node')->fields(['vid' => $previous_vid])->condition('nid', $nid)->execute();
+    entity_get_controller('node')->resetCache([$nid]);
+  }
+
+  /**
+   * Insert a candidate row with task_type=edit_proposed and the given
+   * before_state, return its acid.
+   */
+  protected function createEditProposedCandidate($nid, array $before_state) {
+    $cid = db_insert('ai_content_audit_cluster')
+      ->fields([
+        'run_id' => 'paragraph-test',
+        'profile' => 'default',
+        'topic_label' => 'PT',
+        'canonical_nid' => $nid,
+        'source_count' => 1,
+        'created' => REQUEST_TIME,
+        'updated' => REQUEST_TIME,
+      ])
+      ->execute();
+    return db_insert('ai_content_audit_candidate')
+      ->fields([
+        'cluster_id' => $cid,
+        'run_id' => 'paragraph-test',
+        'nid' => $nid,
+        'bundle' => 'paragraph_host',
+        'title' => 'Host node',
+        'task_type' => 'edit_proposed',
+        'status' => 'pending',
+        'before_state' => json_encode($before_state),
+        'proposed_action_detail' => 'AI proposed paragraph edit',
+        'created' => REQUEST_TIME,
+        'updated' => REQUEST_TIME,
+      ])
+      ->execute();
+  }
+
+  /**
+   * Branch 1: proposed paragraph revision IS the paragraph's current default.
+   * Reject must re-point paragraphs_item back to the previous revision AND
+   * delete the orphan proposed revision.
+   */
+  public function testRejectRepointsAndDeletesWhenProposedIsDefault() {
+    $fx = $this->createHostNodeWithParagraph('Original');
+    $proposed_rev_id = $this->saveNewParagraphRevision($fx['nid'], 'AI-proposed paragraph text');
+    $proposed_vid = (int) db_query('SELECT vid FROM {node} WHERE nid = :n', [':n' => $fx['nid']])->fetchField();
+    $this->detachCurrentNodeVid($fx['nid'], $fx['original_vid']);
+
+    // Sanity: the proposed paragraph revision is the paragraph's default rev.
+    $current = (int) db_query('SELECT revision_id FROM {paragraphs_item} WHERE item_id = :id', [':id' => $fx['paragraph_item_id']])->fetchField();
+    $this->assertEqual($proposed_rev_id, $current, 'Fixture: paragraph default rev is the proposed rev.');
+
+    $acid = $this->createEditProposedCandidate($fx['nid'], [
+      'proposed_vid' => $proposed_vid,
+      'paragraph_item_id' => $fx['paragraph_item_id'],
+      'paragraph_previous_revision_id' => $fx['previous_paragraph_revision_id'],
+      'paragraph_proposed_revision_id' => $proposed_rev_id,
+      'original_task_type' => 'merge',
+      'original_status' => 'pending',
+    ]);
+
+    ai_content_audit_update_candidate_status([$acid], 'rejected', 1);
+
+    // Paragraph default revision rolled back to the previous rev.
+    $after = (int) db_query('SELECT revision_id FROM {paragraphs_item} WHERE item_id = :id', [':id' => $fx['paragraph_item_id']])->fetchField();
+    $this->assertEqual($fx['previous_paragraph_revision_id'], $after, 'paragraphs_item.revision_id repointed back to previous after reject.');
+
+    // The proposed paragraph revision is deleted.
+    $rev_exists = (int) db_query('SELECT COUNT(*) FROM {paragraphs_item_revision} WHERE revision_id = :rid', [':rid' => $proposed_rev_id])->fetchField();
+    $this->assertEqual(0, $rev_exists, 'Orphan paragraph revision deleted.');
+
+    // The previous paragraph revision still exists.
+    $prev_exists = (int) db_query('SELECT COUNT(*) FROM {paragraphs_item_revision} WHERE revision_id = :rid', [':rid' => $fx['previous_paragraph_revision_id']])->fetchField();
+    $this->assertEqual(1, $prev_exists, 'Previous paragraph revision preserved.');
+
+    // The proposed node revision is also deleted.
+    $node_rev_exists = (int) db_query('SELECT COUNT(*) FROM {node_revision} WHERE vid = :v', [':v' => $proposed_vid])->fetchField();
+    $this->assertEqual(0, $node_rev_exists, 'Proposed node revision deleted.');
+
+    // Candidate row was unwound to its original task_type.
+    $row = db_query('SELECT task_type, status FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('merge', $row['task_type'], 'task_type restored.');
+    $this->assertEqual('pending', $row['status'], 'status restored (not rejected).');
+  }
+
+  /**
+   * Branch 2: proposed paragraph revision is NOT the paragraph's current
+   * default — something newer was saved between propose and reject. Reject
+   * must delete the orphan but must NOT touch paragraphs_item.revision_id.
+   */
+  public function testRejectDeletesOrphanWithoutRepointWhenNotDefault() {
+    $fx = $this->createHostNodeWithParagraph('Original');
+    $proposed_rev_id = $this->saveNewParagraphRevision($fx['nid'], 'AI-proposed paragraph text');
+    $proposed_vid = (int) db_query('SELECT vid FROM {node} WHERE nid = :n', [':n' => $fx['nid']])->fetchField();
+    $this->detachCurrentNodeVid($fx['nid'], $fx['original_vid']);
+
+    // Simulate a later edit landing on the paragraph after the proposal:
+    // saving another revision moves the default forward, leaving the
+    // proposed revision as a non-default orphan.
+    $newer_rev_id = $this->saveNewParagraphRevision($fx['nid'], 'Human edit after AI proposal');
+    $this->assertNotEqual($proposed_rev_id, $newer_rev_id, 'Fixture: a newer paragraph revision was saved over the proposed one.');
+
+    $acid = $this->createEditProposedCandidate($fx['nid'], [
+      'proposed_vid' => $proposed_vid,
+      'paragraph_item_id' => $fx['paragraph_item_id'],
+      'paragraph_previous_revision_id' => $fx['previous_paragraph_revision_id'],
+      'paragraph_proposed_revision_id' => $proposed_rev_id,
+      'original_task_type' => 'flag_for_review',
+      'original_status' => 'pending',
+    ]);
+
+    ai_content_audit_update_candidate_status([$acid], 'rejected', 1);
+
+    // paragraphs_item.revision_id MUST still be the newer rev, NOT touched.
+    $after_row = db_query('SELECT revision_id, archived FROM {paragraphs_item} WHERE item_id = :id', [':id' => $fx['paragraph_item_id']])->fetchAssoc();
+    $this->assertEqual($newer_rev_id, (int) $after_row['revision_id'], 'paragraphs_item.revision_id left at the newer (post-proposal) rev.');
+    $this->assertEqual(0, (int) $after_row['archived'], 'paragraphs_item.archived NOT flipped to 1 by the unwind.');
+
+    // Orphan proposed revision deleted.
+    $rev_exists = (int) db_query('SELECT COUNT(*) FROM {paragraphs_item_revision} WHERE revision_id = :rid', [':rid' => $proposed_rev_id])->fetchField();
+    $this->assertEqual(0, $rev_exists, 'Orphan proposed paragraph revision deleted.');
+
+    // Newer rev preserved.
+    $newer_exists = (int) db_query('SELECT COUNT(*) FROM {paragraphs_item_revision} WHERE revision_id = :rid', [':rid' => $newer_rev_id])->fetchField();
+    $this->assertEqual(1, $newer_exists, 'Newer paragraph revision preserved.');
+
+    // Previous rev preserved.
+    $prev_exists = (int) db_query('SELECT COUNT(*) FROM {paragraphs_item_revision} WHERE revision_id = :rid', [':rid' => $fx['previous_paragraph_revision_id']])->fetchField();
+    $this->assertEqual(1, $prev_exists, 'Previous paragraph revision preserved.');
+  }
+
+  /**
+   * Branch 3: legacy fallback. Rows rejected before the paragraph-pointer fix
+   * landed only stored target_context, not explicit
+   * paragraph_proposed_revision_id. The unwind must reconstruct the orphan
+   * via MIN(revision_id) > previous and still clean it up.
+   */
+  public function testLegacyFallbackReconstructsPointers() {
+    $fx = $this->createHostNodeWithParagraph('Original');
+    $proposed_rev_id = $this->saveNewParagraphRevision($fx['nid'], 'AI-proposed paragraph text');
+    $proposed_vid = (int) db_query('SELECT vid FROM {node} WHERE nid = :n', [':n' => $fx['nid']])->fetchField();
+    $this->detachCurrentNodeVid($fx['nid'], $fx['original_vid']);
+
+    // Legacy before_state — target_context only, NO paragraph_proposed_revision_id.
+    $acid = $this->createEditProposedCandidate($fx['nid'], [
+      'proposed_vid' => $proposed_vid,
+      'target_context' => [
+        'target_type' => 'paragraph_field',
+        'item_id' => $fx['paragraph_item_id'],
+        'revision_id' => $fx['previous_paragraph_revision_id'],
+      ],
+      'original_task_type' => 'merge',
+      'original_status' => 'pending',
+    ]);
+
+    ai_content_audit_update_candidate_status([$acid], 'rejected', 1);
+
+    // Legacy path should have reconstructed and repointed.
+    $after = (int) db_query('SELECT revision_id FROM {paragraphs_item} WHERE item_id = :id', [':id' => $fx['paragraph_item_id']])->fetchField();
+    $this->assertEqual($fx['previous_paragraph_revision_id'], $after, 'Legacy fallback repointed paragraphs_item back to previous rev.');
+
+    $rev_exists = (int) db_query('SELECT COUNT(*) FROM {paragraphs_item_revision} WHERE revision_id = :rid', [':rid' => $proposed_rev_id])->fetchField();
+    $this->assertEqual(0, $rev_exists, 'Legacy fallback deleted the reconstructed orphan paragraph revision.');
+  }
+}

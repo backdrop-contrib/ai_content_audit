@@ -1,0 +1,277 @@
+<?php
+
+/**
+ * @file
+ * Tests for ai_content_audit reject/unwind behaviour.
+ *
+ * Exercises ai_content_audit_update_candidate_status() — the function that
+ * runs when an admin rejects a queued candidate. The rejection path has
+ * non-trivial side effects (deleting proposed node revisions, restoring
+ * task_type from before_state) and has had real bugs fixed in it, so it is
+ * the highest-value surface to cover.
+ */
+
+class AIContentAuditRejectUnwindTestCase extends BackdropWebTestCase {
+
+  /**
+   * Backdrop testbot description.
+   */
+  public static function getInfo() {
+    return [
+      'name' => 'AI Content Audit reject/unwind',
+      'description' => 'Verifies that rejecting a candidate restores prior task_type, clears before_state, and deletes proposed node revisions.',
+      'group' => 'AI Content Audit',
+    ];
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function setUp() {
+    parent::setUp(['ai', 'ai_content_audit']);
+    $this->backdropCreateContentType(['type' => 'post', 'name' => 'Post']);
+  }
+
+  /**
+   * Insert a fixture cluster and return its cid.
+   */
+  protected function createCluster($run_id = 'test-run-1', $canonical_nid = 0) {
+    return db_insert('ai_content_audit_cluster')
+      ->fields([
+        'run_id' => $run_id,
+        'profile' => 'default',
+        'topic_label' => 'Test cluster',
+        'canonical_nid' => $canonical_nid,
+        'source_count' => 2,
+        'similarity_score' => 0.9,
+        'review_state' => 'pending',
+        'recommended_action' => 'merge',
+        'rot_type' => 'redundant',
+        'created' => REQUEST_TIME,
+        'updated' => REQUEST_TIME,
+      ])
+      ->execute();
+  }
+
+  /**
+   * Insert a fixture candidate row and return its acid.
+   */
+  protected function createCandidate($cluster_id, $nid, array $overrides = []) {
+    $fields = [
+      'cluster_id' => $cluster_id,
+      'run_id' => 'test-run-1',
+      'nid' => $nid,
+      'bundle' => 'post',
+      'title' => 'Fixture candidate',
+      'similarity_score' => 0.8,
+      'is_canonical' => 0,
+      'task_type' => 'edit_proposed',
+      'status' => 'pending',
+      'before_state' => NULL,
+      'proposed_action_detail' => 'Some proposed change',
+      'created' => REQUEST_TIME,
+      'updated' => REQUEST_TIME,
+    ];
+    $fields = array_merge($fields, $overrides);
+    return db_insert('ai_content_audit_candidate')->fields($fields)->execute();
+  }
+
+  /**
+   * Create a node and add a second (draft) revision; return [nid, original_vid, proposed_vid].
+   */
+  protected function createNodeWithDraftRevision() {
+    $node = new Node([
+      'type' => 'post',
+      'title' => 'Original title',
+      'uid' => 1,
+      'status' => 1,
+      'body' => [LANGUAGE_NONE => [['value' => 'Original body', 'format' => 'plain_text']]],
+    ]);
+    node_save($node);
+    $original_vid = $node->vid;
+
+    // Add a draft (unpublished) revision representing the proposed edit.
+    $node->title = 'Proposed title';
+    $node->body[LANGUAGE_NONE][0]['value'] = 'Proposed body';
+    $node->revision = 1;
+    $node->status = 0;
+    $node->log = 'Proposed by ai_content_audit test';
+    node_save($node);
+    $proposed_vid = $node->vid;
+
+    // Mirror real propose_edit behaviour: the proposed revision is NOT the
+    // node's active revision. Without this, node_revision_delete() refuses to
+    // delete it (it won't remove an active revision). Production code achieves
+    // the same effect via draft_workflow's is_active_revision = FALSE.
+    db_update('node')->fields(['vid' => $original_vid])->condition('nid', $node->nid)->execute();
+    entity_get_controller('node')->resetCache([$node->nid]);
+
+    return [$node->nid, $original_vid, $proposed_vid];
+  }
+
+  /**
+   * Rejecting an edit_proposed candidate must restore the prior task_type,
+   * delete the staged draft revision, and clear before_state.
+   */
+  public function testRejectEditProposedRestoresOriginalTask() {
+    list($nid, $original_vid, $proposed_vid) = $this->createNodeWithDraftRevision();
+    $cid = $this->createCluster('test-run-1', $nid);
+
+    $before_state = [
+      'proposed_vid' => $proposed_vid,
+      'original_task_type' => 'merge',
+      'original_status' => 'pending',
+    ];
+
+    $acid = $this->createCandidate($cid, $nid, [
+      'task_type' => 'edit_proposed',
+      'status' => 'pending',
+      'before_state' => json_encode($before_state),
+    ]);
+
+    ai_content_audit_update_candidate_status([$acid], 'rejected', 1);
+
+    $row = db_query('SELECT task_type, status, before_state, proposed_action_detail FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+
+    $this->assertEqual('merge', $row['task_type'], 'task_type restored from before_state.original_task_type.');
+    $this->assertEqual('pending', $row['status'], 'status restored to original_status (not rejected) when row was unwound.');
+    $this->assertTrue($row['before_state'] === NULL || $row['before_state'] === '', 'before_state cleared after revert.');
+    $this->assertEqual('', $row['proposed_action_detail'], 'proposed_action_detail cleared after revert.');
+
+    // Draft revision should be gone; the original revision should remain.
+    $remaining = db_query('SELECT vid FROM {node_revision} WHERE nid = :n ORDER BY vid', [':n' => $nid])->fetchCol();
+    $this->assertTrue(in_array($original_vid, $remaining), 'Original node revision preserved.');
+    $this->assertFalse(in_array($proposed_vid, $remaining), 'Proposed draft node revision deleted.');
+  }
+
+  /**
+   * If before_state has no original_task_type, the row stays as edit_proposed
+   * but is marked rejected and its draft revision is still deleted.
+   */
+  public function testRejectEditProposedWithoutOriginalTaskMarksRejected() {
+    list($nid, $original_vid, $proposed_vid) = $this->createNodeWithDraftRevision();
+    $cid = $this->createCluster('test-run-1', $nid);
+
+    $acid = $this->createCandidate($cid, $nid, [
+      'task_type' => 'edit_proposed',
+      'status' => 'pending',
+      'before_state' => json_encode(['proposed_vid' => $proposed_vid]),
+    ]);
+
+    ai_content_audit_update_candidate_status([$acid], 'rejected', 1);
+
+    $row = db_query('SELECT task_type, status, before_state, approved_by FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+
+    $this->assertEqual('edit_proposed', $row['task_type'], 'task_type unchanged when no original to restore to.');
+    $this->assertEqual('rejected', $row['status'], 'status flipped to rejected for fall-through case.');
+    $this->assertTrue($row['before_state'] === NULL || $row['before_state'] === '', 'before_state cleared.');
+    $this->assertEqual(0, (int) $row['approved_by'], 'approved_by not set on rejection.');
+
+    $remaining = db_query('SELECT vid FROM {node_revision} WHERE nid = :n', [':n' => $nid])->fetchCol();
+    $this->assertFalse(in_array($proposed_vid, $remaining), 'Proposed draft revision still deleted in fall-through case.');
+  }
+
+  /**
+   * Rejecting a non-edit_proposed candidate (e.g. proposed prune) must NOT
+   * touch revisions and must just mark the row rejected.
+   */
+  public function testRejectNonEditProposedJustMarksStatus() {
+    list($nid, $original_vid, $proposed_vid) = $this->createNodeWithDraftRevision();
+    $cid = $this->createCluster('test-run-1', $nid);
+
+    $acid = $this->createCandidate($cid, $nid, [
+      'task_type' => 'prune',
+      'status' => 'pending',
+      'before_state' => json_encode(['proposed_vid' => $proposed_vid]),
+      'proposed_action_detail' => 'Unpublish this node',
+    ]);
+
+    ai_content_audit_update_candidate_status([$acid], 'rejected', 1);
+
+    $row = db_query('SELECT task_type, status, before_state, proposed_action_detail FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('prune', $row['task_type'], 'Non-edit_proposed task_type unchanged.');
+    $this->assertEqual('rejected', $row['status'], 'Status set to rejected.');
+    $this->assertEqual('Unpublish this node', $row['proposed_action_detail'], 'proposed_action_detail preserved for non-edit_proposed.');
+
+    $remaining = db_query('SELECT vid FROM {node_revision} WHERE nid = :n', [':n' => $nid])->fetchCol();
+    $this->assertTrue(in_array($proposed_vid, $remaining), 'Draft revision untouched for non-edit_proposed reject.');
+  }
+
+  /**
+   * Approving rows records approved_by + approved_at, but only when status is approved.
+   */
+  public function testApproveRecordsApprover() {
+    $cid = $this->createCluster();
+    $acid = $this->createCandidate($cid, 1, ['task_type' => 'prune']);
+
+    $before = REQUEST_TIME - 1;
+    ai_content_audit_update_candidate_status([$acid], 'approved', 42);
+
+    $row = db_query('SELECT status, approved_by, approved_at FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('approved', $row['status'], 'Status set to approved.');
+    $this->assertEqual(42, (int) $row['approved_by'], 'approved_by recorded.');
+    $this->assertTrue((int) $row['approved_at'] >= $before, 'approved_at timestamp recorded.');
+  }
+
+  /**
+   * Setting a non-approved status with a uid must NOT record approved_by.
+   * (Guards against accidentally writing approver fields on dismiss/fail.)
+   */
+  public function testNonApprovedStatusDoesNotRecordApprover() {
+    $cid = $this->createCluster();
+    $acid = $this->createCandidate($cid, 1, ['task_type' => 'prune']);
+
+    ai_content_audit_update_candidate_status([$acid], 'dismissed', 42);
+
+    $row = db_query('SELECT status, approved_by, approved_at FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('dismissed', $row['status'], 'Status set to dismissed.');
+    $this->assertEqual(0, (int) $row['approved_by'], 'approved_by not recorded for non-approved status.');
+    $this->assertEqual(0, (int) $row['approved_at'], 'approved_at not recorded for non-approved status.');
+  }
+
+  /**
+   * Calling with an empty acids array must not error and must not touch rows.
+   */
+  public function testEmptyAcidsArrayIsNoop() {
+    $cid = $this->createCluster();
+    $acid = $this->createCandidate($cid, 1, ['task_type' => 'prune', 'status' => 'pending']);
+
+    ai_content_audit_update_candidate_status([], 'rejected', 1);
+
+    $row = db_query('SELECT status FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid])->fetchAssoc();
+    $this->assertEqual('pending', $row['status'], 'Untouched candidate still pending after empty-acids call.');
+  }
+
+  /**
+   * Rejecting two edit_proposed rows in one call — one with original_task_type,
+   * one without — applies the correct rule to each.
+   */
+  public function testRejectMixedBatch() {
+    list($nid_a, , $proposed_vid_a) = $this->createNodeWithDraftRevision();
+    list($nid_b, , $proposed_vid_b) = $this->createNodeWithDraftRevision();
+    $cid = $this->createCluster('test-run-1', $nid_a);
+
+    $acid_a = $this->createCandidate($cid, $nid_a, [
+      'task_type' => 'edit_proposed',
+      'before_state' => json_encode([
+        'proposed_vid' => $proposed_vid_a,
+        'original_task_type' => 'flag_for_review',
+        'original_status' => 'pending',
+      ]),
+    ]);
+    $acid_b = $this->createCandidate($cid, $nid_b, [
+      'task_type' => 'edit_proposed',
+      'before_state' => json_encode(['proposed_vid' => $proposed_vid_b]),
+    ]);
+
+    ai_content_audit_update_candidate_status([$acid_a, $acid_b], 'rejected', 1);
+
+    $row_a = db_query('SELECT task_type, status FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid_a])->fetchAssoc();
+    $row_b = db_query('SELECT task_type, status FROM {ai_content_audit_candidate} WHERE acid = :a', [':a' => $acid_b])->fetchAssoc();
+
+    $this->assertEqual('flag_for_review', $row_a['task_type'], 'Row A restored to its original_task_type.');
+    $this->assertEqual('pending', $row_a['status'], 'Row A kept its restored status (not rejected).');
+    $this->assertEqual('edit_proposed', $row_b['task_type'], 'Row B left at edit_proposed (no original to restore).');
+    $this->assertEqual('rejected', $row_b['status'], 'Row B marked rejected.');
+  }
+}

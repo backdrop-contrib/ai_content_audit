@@ -1,0 +1,251 @@
+<?php
+
+/**
+ * @file
+ * Install hooks and schema for AI Content Audit.
+ *
+ * Schema (5 tables):
+ *   - ai_content_audit_run        — one row per scan run, with status,
+ *                                    pending nid queue (BLOB), batch counts.
+ *   - ai_content_audit_cluster    — one row per cluster, with topic label,
+ *                                    canonical nid, similarity/age/traffic/
+ *                                    composite scores, ROT type, recommended
+ *                                    action, llm_summary, review_state.
+ *   - ai_content_audit_candidate  — one row per (cluster, node), with
+ *                                    is_canonical flag, task_type, status,
+ *                                    before_state JSON (for reject-unwind),
+ *                                    proposed_action_detail, approver fields.
+ *   - ai_content_audit_edge       — raw pairwise similarity edges collected
+ *                                    during incremental scan; discarded after
+ *                                    finalize.
+ *   - ai_content_audit_traffic    — uploaded GA4 pageviews CSV mapped by path.
+ *
+ * Update hooks N_1000–N_1004 cover schema bootstrap and the rename from the
+ * older module key (ai_agents_content_audit → ai_content_audit).
+ */
+
+/**
+ * Implements hook_install().
+ */
+function ai_content_audit_install() {
+  if (!module_load_install('ai_upgrade')) { return []; }
+  ai_upgrade_module_install('ai_content_audit');
+}
+
+/**
+ * Implements hook_schema().
+ */
+function ai_content_audit_schema() {
+  $schema = [];
+
+  $schema['ai_content_audit_run'] = [
+    'description' => 'Records each content audit scan run.',
+    'fields' => [
+      'rid' => ['type' => 'serial', 'not null' => TRUE],
+      'run_id' => ['type' => 'varchar', 'length' => 64, 'not null' => TRUE, 'default' => ''],
+      'profile' => ['type' => 'varchar', 'length' => 64, 'not null' => TRUE, 'default' => 'default'],
+      'status' => ['type' => 'varchar', 'length' => 16, 'not null' => TRUE, 'default' => 'running'],
+      'started' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'finished' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'node_count' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'cluster_count' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'total_nodes' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'processed_nodes' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'pending_nids' => ['type' => 'blob', 'size' => 'big', 'not null' => FALSE],
+      'notes' => ['type' => 'text', 'size' => 'big', 'not null' => FALSE],
+    ],
+    'primary key' => ['rid'],
+    'indexes' => [
+      'run_id' => ['run_id'],
+      'status' => ['status'],
+      'started' => ['started'],
+    ],
+  ];
+
+  $schema['ai_content_audit_cluster'] = [
+    'description' => 'A group of semantically similar content nodes identified during an audit run.',
+    'fields' => [
+      'cid' => ['type' => 'serial', 'not null' => TRUE],
+      'run_id' => ['type' => 'varchar', 'length' => 64, 'not null' => TRUE, 'default' => ''],
+      'profile' => ['type' => 'varchar', 'length' => 64, 'not null' => TRUE, 'default' => 'default'],
+      'topic_label' => ['type' => 'varchar', 'length' => 512, 'not null' => TRUE, 'default' => ''],
+      'canonical_nid' => ['type' => 'int', 'unsigned' => TRUE, 'not null' => TRUE, 'default' => 0],
+      'source_count' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'similarity_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'traffic_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'age_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'composite_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'review_state' => ['type' => 'varchar', 'length' => 16, 'not null' => TRUE, 'default' => 'pending'],
+      'recommended_action' => ['type' => 'varchar', 'length' => 32, 'not null' => TRUE, 'default' => ''],
+      'rot_type' => ['type' => 'varchar', 'length' => 32, 'not null' => TRUE, 'default' => '', 'description' => 'ROT classification: redundant, outdated, trivial, or combination.'],
+      'evidence_summary' => ['type' => 'text', 'size' => 'big', 'not null' => FALSE],
+      'llm_summary' => ['type' => 'text', 'size' => 'big', 'not null' => FALSE],
+      'created' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'updated' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+    ],
+    'primary key' => ['cid'],
+    'indexes' => [
+      'run_id' => ['run_id'],
+      'review_state' => ['review_state'],
+      'composite_score' => ['composite_score'],
+      'canonical_nid' => ['canonical_nid'],
+    ],
+  ];
+
+  $schema['ai_content_audit_candidate'] = [
+    'description' => 'Individual nodes within an audit cluster, with per-node scores and proposed actions.',
+    'fields' => [
+      'acid' => ['type' => 'serial', 'not null' => TRUE],
+      'cluster_id' => ['type' => 'int', 'unsigned' => TRUE, 'not null' => TRUE, 'default' => 0],
+      'run_id' => ['type' => 'varchar', 'length' => 64, 'not null' => TRUE, 'default' => ''],
+      'nid' => ['type' => 'int', 'unsigned' => TRUE, 'not null' => TRUE, 'default' => 0],
+      'bundle' => ['type' => 'varchar', 'length' => 128, 'not null' => TRUE, 'default' => ''],
+      'title' => ['type' => 'varchar', 'length' => 512, 'not null' => TRUE, 'default' => ''],
+      'similarity_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'is_canonical' => ['type' => 'int', 'size' => 'tiny', 'not null' => TRUE, 'default' => 0],
+      'task_type' => ['type' => 'varchar', 'length' => 64, 'not null' => TRUE, 'default' => ''],
+      'evidence_snippet' => ['type' => 'text', 'size' => 'big', 'not null' => FALSE],
+      'before_state' => ['type' => 'text', 'size' => 'big', 'not null' => FALSE],
+      'proposed_action_detail' => ['type' => 'text', 'size' => 'big', 'not null' => FALSE],
+      'status' => ['type' => 'varchar', 'length' => 16, 'not null' => TRUE, 'default' => 'pending'],
+      'created' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'updated' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'approved_by' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'approved_at' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'applied_at' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'error_message' => ['type' => 'text', 'size' => 'big', 'not null' => FALSE],
+    ],
+    'primary key' => ['acid'],
+    'indexes' => [
+      'cluster_id' => ['cluster_id'],
+      'run_id' => ['run_id'],
+      'nid' => ['nid'],
+      'status' => ['status'],
+      'task_type' => ['task_type'],
+    ],
+  ];
+
+  $schema['ai_content_audit_edge'] = [
+    'description' => 'Raw pairwise similarity edges collected during incremental scan. Discarded after finalization.',
+    'fields' => [
+      'eid'    => ['type' => 'serial', 'not null' => TRUE],
+      'run_id' => ['type' => 'varchar', 'length' => 64, 'not null' => TRUE, 'default' => ''],
+      'nid_a'  => ['type' => 'int', 'unsigned' => TRUE, 'not null' => TRUE, 'default' => 0],
+      'nid_b'  => ['type' => 'int', 'unsigned' => TRUE, 'not null' => TRUE, 'default' => 0],
+      'score'  => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+    ],
+    'primary key' => ['eid'],
+    'indexes' => [
+      'run_id' => ['run_id'],
+    ],
+  ];
+
+  $schema['ai_content_audit_traffic'] = [
+    'description' => 'Uploaded analytics traffic data mapped by page path.',
+    'fields' => [
+      'tid'      => ['type' => 'serial', 'not null' => TRUE],
+      'path'     => ['type' => 'varchar', 'length' => 512, 'not null' => TRUE, 'default' => ''],
+      'pageviews' => ['type' => 'int', 'unsigned' => TRUE, 'not null' => TRUE, 'default' => 0],
+      'uploaded' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+    ],
+    'primary key' => ['tid'],
+    'indexes' => [
+      'path' => [['path', 191]],
+    ],
+  ];
+
+  return $schema;
+}
+
+/**
+ * Create content audit storage tables.
+ */
+function ai_content_audit_update_1000() {
+  $schema = ai_content_audit_schema();
+  foreach ($schema as $table => $definition) {
+    if (!db_table_exists($table)) {
+      db_create_table($table, $definition);
+    }
+  }
+}
+
+/**
+ * Create traffic table for uploaded analytics data.
+ */
+function ai_content_audit_update_1001() {
+  if (!db_table_exists('ai_content_audit_traffic')) {
+    $schema = ai_content_audit_schema();
+    db_create_table('ai_content_audit_traffic', $schema['ai_content_audit_traffic']);
+  }
+}
+
+/**
+ * Add incremental scan columns and edge table.
+ */
+function ai_content_audit_update_1002() {
+  if (!db_field_exists('ai_content_audit_run', 'total_nodes')) {
+    db_add_field('ai_content_audit_run', 'total_nodes', ['type' => 'int', 'not null' => TRUE, 'default' => 0]);
+  }
+  if (!db_field_exists('ai_content_audit_run', 'processed_nodes')) {
+    db_add_field('ai_content_audit_run', 'processed_nodes', ['type' => 'int', 'not null' => TRUE, 'default' => 0]);
+  }
+  if (!db_field_exists('ai_content_audit_run', 'pending_nids')) {
+    db_add_field('ai_content_audit_run', 'pending_nids', ['type' => 'blob', 'size' => 'big', 'not null' => FALSE]);
+  }
+  if (!db_table_exists('ai_content_audit_edge')) {
+    $schema = ai_content_audit_schema();
+    db_create_table('ai_content_audit_edge', $schema['ai_content_audit_edge']);
+  }
+}
+
+/**
+ * Add rot_type column to cluster table.
+ */
+function ai_content_audit_update_1003() {
+  if (!db_field_exists('ai_content_audit_cluster', 'rot_type')) {
+    db_add_field('ai_content_audit_cluster', 'rot_type', [
+      'type' => 'varchar',
+      'length' => 32,
+      'not null' => TRUE,
+      'default' => '',
+      'description' => 'ROT classification: redundant, outdated, trivial, or combination.',
+    ]);
+  }
+}
+
+/**
+ * Migrate from ai_agents_content_audit: rename tables and move config.
+ */
+function ai_content_audit_update_1004() {
+  $table_map = [
+    'ai_agents_audit_run'       => 'ai_content_audit_run',
+    'ai_agents_audit_cluster'   => 'ai_content_audit_cluster',
+    'ai_agents_audit_candidate' => 'ai_content_audit_candidate',
+    'ai_agents_audit_edge'      => 'ai_content_audit_edge',
+    'ai_agents_audit_traffic'   => 'ai_content_audit_traffic',
+  ];
+  foreach ($table_map as $old => $new) {
+    if (db_table_exists($old) && !db_table_exists($new)) {
+      db_rename_table($old, $new);
+    }
+  }
+
+  // Migrate config key.
+  $old_config = config('ai_agents_content_audit.settings');
+  $data = $old_config->get();
+  if (!empty($data) && !isset($data['_config_name'])) {
+    $new_config = config('ai_content_audit.settings');
+    foreach ($data as $key => $value) {
+      $new_config->set($key, $value);
+    }
+    $new_config->save();
+  }
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function ai_content_audit_requirements($phase) {
+  if (!module_load_install('ai_upgrade')) { return []; }
+  return ai_upgrade_module_requirements($phase, 'ai_content_audit');
+}

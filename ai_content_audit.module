@@ -1,0 +1,496 @@
+<?php
+
+/**
+ * @file
+ * AI Content Audit — identify and act on redundant/outdated/trivial content.
+ *
+ * Clusters semantically similar nodes via the AI Search vector index, scores
+ * each cluster (similarity + age + traffic → composite), classifies via the
+ * ROT framework (Redundant / Outdated / Trivial), and queues recommended
+ * actions (prune, merge, flag, edit_proposed) for admin approval. No content
+ * is mutated until an admin approves the proposed action.
+ *
+ * This file holds the small / always-loaded surface: hooks (permission, menu,
+ * config, cron, ai_async callbacks, ai_tools), thin helper queries
+ * (load_cluster, load_candidates, cluster_counts, live_cluster_counts), and
+ * the central candidate-status writer ai_content_audit_update_candidate_status()
+ * — which is the function reject-unwind and approve flow run through.
+ *
+ * Heavy logic is split across loaded-on-demand includes:
+ *   - includes/ai_content_audit.scanner.inc   — scan / cluster pipeline.
+ *   - includes/ai_content_audit.scoring.inc   — scoring + ROT classify.
+ *   - includes/ai_content_audit.llm.inc       — summaries + AI draft edits.
+ *   - includes/ai_content_audit.execute.inc   — apply approved actions.
+ *   - includes/ai_content_audit.tools.inc     — AI agent tool definitions.
+ *   - includes/ai_content_audit.admin.inc     — admin forms.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function ai_content_audit_permission() {
+  return [
+    'administer ai content audit' => [
+      'title' => t('Administer AI Content Audit'),
+      'description' => t('Run scans, review clusters, and approve or reject proposed actions.'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ai_content_audit_menu() {
+  $items = [];
+
+  $items['admin/config/ai/content-audit'] = [
+    'title' => 'AI Content Audit',
+    'description' => 'Site-level content clustering and redundancy audit.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_content_audit_dashboard_form'],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  ];
+
+  $items['admin/config/ai/content-audit/dashboard'] = [
+    'title' => 'Overview',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+  ];
+
+  $items['admin/config/ai/content-audit/runs'] = [
+    'title' => 'Runs',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_content_audit_runs_form'],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 0,
+  ];
+
+  $items['admin/config/ai/content-audit/clusters'] = [
+    'title' => 'Clusters',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_content_audit_clusters_form'],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 10,
+  ];
+
+  $items['admin/config/ai/content-audit/clusters/%'] = [
+    'title' => 'Cluster detail',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_content_audit_cluster_detail_form', 5],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_CALLBACK,
+  ];
+
+  $items['admin/config/ai/content-audit/proposed-edit/%/diff'] = [
+    'title' => 'Proposed edit — text diff',
+    'page callback' => 'ai_content_audit_proposed_edit_diff_page',
+    'page arguments' => [5],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_CALLBACK,
+  ];
+
+  $items['admin/config/ai/content-audit/queue'] = [
+    'title' => 'Action Queue',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_content_audit_queue_form'],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 20,
+  ];
+
+  $items['admin/config/ai/content-audit/settings'] = [
+    'title' => 'Settings',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_content_audit_settings_form'],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 30,
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_config_info().
+ */
+function ai_content_audit_config_info() {
+  return [
+    'ai_content_audit.settings' => [
+      'label' => t('AI Content Audit settings'),
+      'group' => t('AI'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Each tick either starts a new scan run or advances the current one by
+ * cron_batch_size nodes. Finalization triggers automatically on last batch.
+ */
+function ai_content_audit_cron() {
+  $config = config('ai_content_audit.settings');
+  if (!$config->get('cron_enabled')) {
+    return;
+  }
+
+  module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.scanner');
+
+  $active_run = ai_content_audit_active_run();
+
+  if (!$active_run) {
+    $interval = (int) $config->get('cron_interval') ?: 86400;
+    $last_run = (int) $config->get('cron_last_run');
+    if (REQUEST_TIME - $last_run < $interval) {
+      return;
+    }
+    $profile = $config->get('default_profile') ?: 'default';
+    $run_id = ai_content_audit_start_run($profile);
+    $config->set('cron_last_run', REQUEST_TIME)->save();
+    watchdog('ai_content_audit', 'Started new scan run @rid.', ['@rid' => $run_id]);
+    return;
+  }
+
+  $cron_batch_size = (int) $config->get('cron_batch_size') ?: 50;
+  $result = ai_content_audit_process_batch($active_run['run_id'], $cron_batch_size);
+
+  watchdog('ai_content_audit', 'Scan @rid: @done/@total node(s) processed.@fin', [
+    '@rid'   => $active_run['run_id'],
+    '@done'  => $result['processed'],
+    '@total' => $result['total'],
+    '@fin'   => $result['finalized'] ? ' Finalized.' : '',
+  ]);
+}
+
+/**
+ * Implements hook_ai_async_callbacks().
+ *
+ * The ai_async worker dispatches callbacks via function_exists() + call_user_func.
+ * Eagerly load the include that defines ai_content_audit_async_summarize so the
+ * worker's existence check passes — registering a callback whose implementation
+ * lives in a lazy-loaded .inc would otherwise silently fail.
+ */
+function ai_content_audit_ai_async_callbacks() {
+  module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.llm');
+  return [
+    'ai_content_audit_async_summarize'   => 'Generate LLM summary for one audit cluster.',
+    'ai_content_audit_async_scan_batch'  => 'Process one scan batch (used by Scan Now button).',
+  ];
+}
+
+/**
+ * ai_async callback: process one scan batch and return progress.
+ */
+function ai_content_audit_async_scan_batch(array $data) {
+  module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.scanner');
+
+  $run_id     = !empty($data['run_id']) ? $data['run_id'] : NULL;
+  $batch_size = !empty($data['batch_size']) ? (int) $data['batch_size'] : 50;
+  $config     = config('ai_content_audit.settings');
+
+  if (!$run_id) {
+    $active = ai_content_audit_active_run();
+    if (!$active) {
+      $profile = $config->get('default_profile') ?: 'default';
+      $run_id = ai_content_audit_start_run($profile);
+    }
+    else {
+      $run_id = $active['run_id'];
+    }
+  }
+
+  return ai_content_audit_process_batch($run_id, $batch_size);
+}
+
+/**
+ * Implements hook_ai_tools().
+ */
+function ai_content_audit_ai_tools() {
+  module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.tools');
+  return ai_content_audit_ai_tools_definitions();
+}
+
+/**
+ * Generate a unique run identifier.
+ */
+function ai_content_audit_run_id() {
+  return REQUEST_TIME . '-' . substr(hash('sha256', mt_rand() . microtime(TRUE)), 0, 8);
+}
+
+/**
+ * Load a cluster record by cid.
+ */
+function ai_content_audit_load_cluster($cid) {
+  return db_query('SELECT * FROM {ai_content_audit_cluster} WHERE cid = :cid', [':cid' => (int) $cid])->fetchAssoc();
+}
+
+/**
+ * Load candidates for a cluster.
+ */
+function ai_content_audit_load_candidates($cluster_id) {
+  return db_query('SELECT * FROM {ai_content_audit_candidate} WHERE cluster_id = :cid ORDER BY is_canonical DESC, similarity_score DESC', [':cid' => (int) $cluster_id])->fetchAllAssoc('acid', PDO::FETCH_ASSOC);
+}
+
+/**
+ * Update candidate status.
+ */
+function ai_content_audit_update_candidate_status(array $acids, $status, $uid = 0) {
+  if (empty($acids)) {
+    return;
+  }
+  if ($status === 'rejected') {
+    $restore_rows = db_query(
+      'SELECT acid, before_state FROM {ai_content_audit_candidate} WHERE acid IN (:acids) AND task_type = :type',
+      [':acids' => $acids, ':type' => 'edit_proposed']
+    )->fetchAllAssoc('acid', PDO::FETCH_ASSOC);
+
+    foreach ($restore_rows as $acid => $row) {
+      $vids = !empty($row['before_state']) ? json_decode($row['before_state'], TRUE) : [];
+
+      // Legacy fallback: rows rejected before this fix landed only stored
+      // target_context, not paragraph_proposed_revision_id. Reconstruct the
+      // pointers so re-running reject on those rows still unwinds them.
+      if (
+        empty($vids['paragraph_proposed_revision_id']) &&
+        !empty($vids['target_context']) &&
+        is_array($vids['target_context']) &&
+        !empty($vids['target_context']['target_type']) &&
+        $vids['target_context']['target_type'] === 'paragraph_field' &&
+        !empty($vids['target_context']['item_id']) &&
+        !empty($vids['target_context']['revision_id'])
+      ) {
+        $legacy_item_id = (int) $vids['target_context']['item_id'];
+        $legacy_prev_rev = (int) $vids['target_context']['revision_id'];
+        // Any paragraph revision for this item with id greater than the
+        // recorded original is a candidate orphan. Pick the smallest one
+        // greater than the original — that's what propose_edit would have
+        // created.
+        $orphan_rev = db_query(
+          'SELECT MIN(revision_id) FROM {paragraphs_item_revision} WHERE item_id = :id AND revision_id > :prev',
+          [':id' => $legacy_item_id, ':prev' => $legacy_prev_rev]
+        )->fetchField();
+        if ($orphan_rev) {
+          $vids['paragraph_item_id'] = $legacy_item_id;
+          $vids['paragraph_previous_revision_id'] = $legacy_prev_rev;
+          $vids['paragraph_proposed_revision_id'] = (int) $orphan_rev;
+        }
+      }
+
+      // Capture the paragraph's current default revision BEFORE deleting the
+      // node revision. node_revision_delete() fires field_attach_delete_revision
+      // which fires paragraphs_field_delete_revision() which calls
+      // ParagraphsItemEntity::deleteRevision() on the paragraph revisions the
+      // node revision pointed at. That method has a side effect when the
+      // deleted revision is non-default: it mutates paragraphs_item.revision_id
+      // to an arbitrary other revision and sets archived = 1, silently
+      // reverting the live site to an older paragraph revision. We restore
+      // the correct pointer after the cascade.
+      $pre_delete_paragraph_default = NULL;
+      $paragraph_item_id = !empty($vids['paragraph_item_id']) ? (int) $vids['paragraph_item_id'] : 0;
+      if ($paragraph_item_id && module_exists('paragraphs')) {
+        $pre_delete_paragraph_default = (int) db_query(
+          'SELECT revision_id FROM {paragraphs_item} WHERE item_id = :id',
+          [':id' => $paragraph_item_id]
+        )->fetchField();
+      }
+
+      if (!empty($vids['proposed_vid']) && function_exists('node_revision_delete')) {
+        node_revision_delete((int) $vids['proposed_vid']);
+      }
+
+      // Repair paragraphs_item.revision_id if the cascade above clobbered it,
+      // and ensure the orphan proposed revision is actually gone.
+      // Two cases:
+      //   - Proposed paragraph rev WAS the default (no human edit landed in
+      //     between): re-point to the previous revision so the live node
+      //     renders the original text. The cascade's entity_plus_revision_delete
+      //     refuses to delete a default revision, so we also have to delete
+      //     the orphan revision row here ourselves.
+      //   - Proposed paragraph rev was NOT the default (a newer edit existed):
+      //     restore the pre-delete default so the live node keeps rendering
+      //     the newest accepted edit.
+      if ($paragraph_item_id && $pre_delete_paragraph_default && module_exists('paragraphs')) {
+        $proposed_rev_id = !empty($vids['paragraph_proposed_revision_id']) ? (int) $vids['paragraph_proposed_revision_id'] : 0;
+        $previous_rev_id = !empty($vids['paragraph_previous_revision_id']) ? (int) $vids['paragraph_previous_revision_id'] : 0;
+        $target_rev = NULL;
+        if ($pre_delete_paragraph_default === $proposed_rev_id && $previous_rev_id && $previous_rev_id !== $proposed_rev_id) {
+          $target_rev = $previous_rev_id;
+        }
+        elseif ($pre_delete_paragraph_default !== $proposed_rev_id) {
+          $target_rev = $pre_delete_paragraph_default;
+        }
+        if ($target_rev) {
+          db_update('paragraphs_item')
+            ->fields(['revision_id' => $target_rev, 'archived' => 0])
+            ->condition('item_id', $paragraph_item_id)
+            ->execute();
+        }
+
+        // Force-delete the orphan revision if it survived (the cascade refuses
+        // to delete a revision that was default at the time it ran).
+        if ($proposed_rev_id) {
+          $still_exists = (int) db_query(
+            'SELECT COUNT(*) FROM {paragraphs_item_revision} WHERE revision_id = :rid',
+            [':rid' => $proposed_rev_id]
+          )->fetchField();
+          if ($still_exists) {
+            try {
+              // Load the proposed revision so we can clean its field revision
+              // data before deleting the row. field_attach_delete_revision
+              // requires a real entity with bundle, item_id, and revision_id.
+              $orphan = function_exists('paragraphs_item_revision_load')
+                ? paragraphs_item_revision_load($proposed_rev_id)
+                : NULL;
+              if ($orphan) {
+                field_attach_delete_revision('paragraphs_item', $orphan);
+              }
+              db_delete('paragraphs_item_revision')
+                ->condition('revision_id', $proposed_rev_id)
+                ->execute();
+            }
+            catch (\Exception $e) {
+              watchdog('ai_content_audit', 'Could not delete proposed paragraph revision @rid: @msg', [
+                '@rid' => $proposed_rev_id,
+                '@msg' => $e->getMessage(),
+              ], WATCHDOG_WARNING);
+            }
+          }
+        }
+        entity_get_controller('paragraphs_item')->resetCache([$paragraph_item_id]);
+      }
+
+      if (!empty($vids['original_task_type'])) {
+        db_update('ai_content_audit_candidate')
+          ->fields([
+            'task_type' => $vids['original_task_type'],
+            'status' => !empty($vids['original_status']) ? $vids['original_status'] : 'pending',
+            'before_state' => NULL,
+            'proposed_action_detail' => '',
+            'updated' => REQUEST_TIME,
+          ])
+          ->condition('acid', (int) $acid)
+          ->execute();
+      }
+      else {
+        // No prior task_type to restore to — this candidate was created
+        // directly as edit_proposed. Clear the draft pointers but leave the
+        // row in place so the bulk update below marks it rejected.
+        db_update('ai_content_audit_candidate')
+          ->fields([
+            'before_state' => NULL,
+            'proposed_action_detail' => '',
+            'updated' => REQUEST_TIME,
+          ])
+          ->condition('acid', (int) $acid)
+          ->execute();
+      }
+    }
+
+    // Only exclude rows we fully restored to a previous task_type. Rows that
+    // had no original_task_type stay in the list so they get status=rejected.
+    $restored_acids = [];
+    foreach ($restore_rows as $acid => $row) {
+      $vids = !empty($row['before_state']) ? json_decode($row['before_state'], TRUE) : [];
+      if (!empty($vids['original_task_type'])) {
+        $restored_acids[] = (int) $acid;
+      }
+    }
+    if (!empty($restored_acids)) {
+      $acids = array_values(array_diff(array_map('intval', $acids), $restored_acids));
+    }
+  }
+
+  if (empty($acids)) {
+    return;
+  }
+
+  $fields = [
+    'status' => $status,
+    'updated' => REQUEST_TIME,
+  ];
+  if ($uid && $status === 'approved') {
+    $fields['approved_by'] = $uid;
+    $fields['approved_at'] = REQUEST_TIME;
+  }
+  db_update('ai_content_audit_candidate')
+    ->fields($fields)
+    ->condition('acid', $acids, 'IN')
+    ->execute();
+}
+
+/**
+ * Get cluster counts by review state.
+ */
+function ai_content_audit_cluster_counts() {
+  $result = db_query('SELECT review_state, COUNT(*) AS cnt FROM {ai_content_audit_cluster} GROUP BY review_state');
+  $counts = [];
+  foreach ($result as $row) {
+    $counts[$row->review_state] = (int) $row->cnt;
+  }
+  return $counts;
+}
+
+/**
+ * Delete clusters and their candidates by cid.
+ */
+function ai_content_audit_delete_clusters(array $cids) {
+  if (empty($cids)) {
+    return;
+  }
+  db_delete('ai_content_audit_candidate')->condition('cluster_id', $cids, 'IN')->execute();
+  db_delete('ai_content_audit_cluster')->condition('cid', $cids, 'IN')->execute();
+}
+
+/**
+ * Apply approved candidates.
+ */
+function ai_content_audit_apply_approved($limit = 5) {
+  module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.execute');
+  return ai_content_audit_execute_approved($limit);
+}
+
+/**
+ * Live "Pages" count for one or more clusters.
+ *
+ * Counts distinct still-existing candidate nodes per cluster, excluding rows
+ * whose status is rejected/dismissed/failed and any rows whose target node no
+ * longer exists. This replaces the stale source_count snapshot taken at scan
+ * time, which does not update when candidates are deleted or filtered out.
+ *
+ * @param int[] $cluster_ids
+ * @return array Map of cluster_id => int count.
+ */
+function ai_content_audit_live_cluster_counts(array $cluster_ids) {
+  $cluster_ids = array_values(array_filter(array_map('intval', $cluster_ids)));
+  if (empty($cluster_ids)) {
+    return [];
+  }
+  $rows = db_query(
+    'SELECT ca.cluster_id, COUNT(DISTINCT ca.nid) AS cnt
+       FROM {ai_content_audit_candidate} ca
+       INNER JOIN {node} n ON n.nid = ca.nid
+      WHERE ca.cluster_id IN (:cids)
+        AND ca.status NOT IN (:excluded)
+      GROUP BY ca.cluster_id',
+    [
+      ':cids' => $cluster_ids,
+      ':excluded' => ['rejected', 'dismissed', 'failed'],
+    ]
+  )->fetchAllKeyed();
+
+  $counts = [];
+  foreach ($cluster_ids as $cid) {
+    $counts[$cid] = isset($rows[$cid]) ? (int) $rows[$cid] : 0;
+  }
+  return $counts;
+}

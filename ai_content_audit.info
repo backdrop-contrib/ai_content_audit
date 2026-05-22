@@ -1,0 +1,6 @@
+name = AI Content Audit
+description = ROT content audit with AI-powered clustering, lifecycle analysis, and proposed edits.
+backdrop = 1.x
+type = module
+package = AI
+dependencies[] = ai
