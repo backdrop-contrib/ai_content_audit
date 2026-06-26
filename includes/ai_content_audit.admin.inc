@@ -688,13 +688,12 @@ function ai_content_audit_queue_form($form, &$form_state) {
     'SELECT ca.*, c.topic_label FROM {ai_content_audit_candidate} ca
      LEFT JOIN {ai_content_audit_cluster} c ON c.cid = ca.cluster_id
      WHERE (
-       (ca.status = :pending_status AND ca.task_type = :pending_task)
+       ca.status = :pending_status
        OR ca.status IN (:statuses)
      )
      ORDER BY ca.updated DESC LIMIT 200',
     [
       ':pending_status' => 'pending',
-      ':pending_task' => 'edit_proposed',
       ':statuses' => ['approved', 'applied', 'rejected', 'failed', 'edit_queued', 'ignored'],
     ]
   )->fetchAllAssoc('acid', PDO::FETCH_ASSOC);

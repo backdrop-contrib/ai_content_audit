@@ -135,7 +135,7 @@ function ai_content_audit_pick_primary_edit_field($node, array $fields = [], $en
   $best_field = '';
   $best_length = 0;
   foreach ($fields as $field_name => $value) {
-    if (in_array($field_name, ['body_format', 'body_summary'], TRUE) || !is_string($value)) {
+    if (!is_string($value) || substr($field_name, -8) === '__format' || substr($field_name, -9) === '__summary') {
       continue;
     }
     $length = backdrop_strlen(trim($value));
