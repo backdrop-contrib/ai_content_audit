@@ -204,12 +204,10 @@ function ai_content_audit_finalize_run($run_id) {
   ai_content_audit_score_traffic($run_id);
   ai_content_audit_rank_clusters($run_id);
 
-  // Trigger lifecycle analysis for every clustered node.
+  // Trigger lifecycle analysis for every clustered node. The async jobs run
+  // after this request, so apply_lifecycle_signals is deferred to a later
+  // cron tick when rows will be in review_status = 'analyzed'.
   _ai_content_audit_trigger_lifecycle($run_id);
-
-  // Fold existing lifecycle verdicts into the recommendations (review →
-  // refresh) so auto-drafting targets the content the lifecycle LLM flagged.
-  ai_content_audit_apply_lifecycle_signals($run_id);
 
   // Submit LLM summary jobs via ai_async (one per cluster).
   $needs_llm = module_exists('ai') && ($config->get('llm_summaries_enabled') || $config->get('auto_draft_edits_enabled'));

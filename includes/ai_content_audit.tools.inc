@@ -466,7 +466,14 @@ function ai_content_audit_execute_trigger_scan(array $args) {
   // Reuse the incremental pipeline: continue the active run if one exists,
   // otherwise start a new one, then process one batch now. Remaining batches
   // are handed to the self-chaining ai_async callback when available.
+  // Treat 'finalizing' runs as active so a tool call mid-finalization does
+  // not start a duplicate concurrent run.
   $active = ai_content_audit_active_run();
+  if (!$active) {
+    $active = db_query(
+      "SELECT * FROM {ai_content_audit_run} WHERE status = 'finalizing' ORDER BY started DESC LIMIT 1"
+    )->fetchAssoc() ?: NULL;
+  }
   if ($active) {
     $run_id = $active['run_id'];
   }

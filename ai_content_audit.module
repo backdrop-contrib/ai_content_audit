@@ -170,6 +170,20 @@ function ai_content_audit_cron() {
     '@total' => $result['total'],
     '@fin'   => $result['finalized'] ? ' Finalized.' : '',
   ]);
+
+  // Apply lifecycle signals to the most recently completed run. This runs on
+  // every cron tick so that signals are folded in once async lifecycle jobs
+  // (queued during finalize_run) have written their review_status = 'analyzed'
+  // rows — which happens after finalization, not during it.
+  if (module_exists('ai_content_lifecycle')) {
+    $recent_run = db_query(
+      "SELECT run_id FROM {ai_content_audit_run} WHERE status = 'complete' ORDER BY finished DESC LIMIT 1"
+    )->fetchField();
+    if ($recent_run) {
+      module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.scoring');
+      ai_content_audit_apply_lifecycle_signals($recent_run);
+    }
+  }
 }
 
 /**
