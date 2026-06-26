@@ -209,7 +209,19 @@ function ai_content_audit_async_scan_batch(array $data) {
     }
   }
 
-  return ai_content_audit_process_batch($run_id, $batch_size);
+  $result = ai_content_audit_process_batch($run_id, $batch_size);
+
+  // Chain the next batch so a full scan completes without waiting on cron
+  // ticks. total = 0 means the run is no longer collecting, which stops the
+  // chain; each batch consumes pending nids, so progress is guaranteed.
+  if (empty($result['finalized']) && !empty($result['total'])) {
+    ai_async_submit('ai_content_audit_async_scan_batch', [
+      'run_id'     => $run_id,
+      'batch_size' => $batch_size,
+    ]);
+  }
+
+  return $result;
 }
 
 /**

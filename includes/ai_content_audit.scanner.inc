@@ -86,7 +86,8 @@ function ai_content_audit_process_batch($run_id, $batch_size = 50) {
     return ['processed' => 0, 'total' => 0, 'finalized' => FALSE];
   }
 
-  $pending = $run['pending_nids'] ? unserialize($run['pending_nids']) : [];
+  $pending = $run['pending_nids'] ? unserialize($run['pending_nids'], ['allowed_classes' => FALSE]) : [];
+  $pending = is_array($pending) ? $pending : [];
   if (empty($pending)) {
     ai_content_audit_finalize_run($run_id);
     return [
@@ -172,6 +173,10 @@ function ai_content_audit_finalize_run($run_id) {
 
   // Trigger lifecycle analysis for every clustered node.
   _ai_content_audit_trigger_lifecycle($run_id);
+
+  // Fold existing lifecycle verdicts into the recommendations (review →
+  // refresh) so auto-drafting targets the content the lifecycle LLM flagged.
+  ai_content_audit_apply_lifecycle_signals($run_id);
 
   // Submit LLM summary jobs via ai_async (one per cluster).
   $needs_llm = module_exists('ai') && ($config->get('llm_summaries_enabled') || $config->get('auto_draft_edits_enabled'));

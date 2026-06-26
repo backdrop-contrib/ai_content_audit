@@ -32,17 +32,22 @@ function ai_content_audit_normalize_text_for_compare($text) {
 
 /**
  * Collect editable text fields from a node (or paragraph entity).
+ *
+ * Pass $entity_type 'paragraphs_item' for paragraph items — they carry their
+ * bundle in $entity->bundle, not $entity->type, so treating them as nodes
+ * silently returns no fields.
  */
-function ai_content_audit_collect_editable_text_fields($node) {
+function ai_content_audit_collect_editable_text_fields($node, $entity_type = 'node') {
   $fields = [];
-  $field_instances = field_info_instances('node', $node->type);
+  list(, , $bundle) = entity_extract_ids($entity_type, $node);
+  $field_instances = field_info_instances($entity_type, $bundle);
 
   foreach ($field_instances as $field_name => $instance) {
     $field_info = field_info_field($field_name);
     if (empty($field_info) || !in_array($field_info['type'], ['text', 'text_long', 'text_with_summary'], TRUE)) {
       continue;
     }
-    $lang = field_language('node', $node, $field_name);
+    $lang = field_language($entity_type, $node, $field_name);
     if (!isset($lang) || $lang === FALSE) {
       $lang = LANGUAGE_NONE;
     }
@@ -90,8 +95,11 @@ function ai_content_audit_collect_paragraph_text_targets($node) {
       if (!$paragraph) {
         continue;
       }
-      $paragraph_fields = ai_content_audit_collect_editable_text_fields($paragraph);
-      $primary_field = ai_content_audit_pick_primary_edit_field($paragraph, $paragraph_fields);
+      $paragraph_fields = ai_content_audit_collect_editable_text_fields($paragraph, 'paragraphs_item');
+      if (empty($paragraph_fields)) {
+        continue;
+      }
+      $primary_field = ai_content_audit_pick_primary_edit_field($paragraph, $paragraph_fields, 'paragraphs_item');
       if (!$primary_field || empty($paragraph_fields[$primary_field])) {
         continue;
       }
@@ -116,9 +124,9 @@ function ai_content_audit_collect_paragraph_text_targets($node) {
 /**
  * Pick the primary editable text field for a node.
  */
-function ai_content_audit_pick_primary_edit_field($node, array $fields = []) {
+function ai_content_audit_pick_primary_edit_field($node, array $fields = [], $entity_type = 'node') {
   if (empty($fields)) {
-    $fields = ai_content_audit_collect_editable_text_fields($node);
+    $fields = ai_content_audit_collect_editable_text_fields($node, $entity_type);
   }
   if (isset($fields['body'])) {
     return 'body';

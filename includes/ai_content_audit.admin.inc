@@ -193,9 +193,25 @@ function ai_content_audit_dashboard_form_submit($form, &$form_state) {
     }
     $result = ai_content_audit_process_batch($active['run_id'], $batch_size);
     if ($result['finalized']) {
+      $cluster_count = (int) db_query(
+        'SELECT cluster_count FROM {ai_content_audit_run} WHERE run_id = :rid',
+        [':rid' => $active['run_id']]
+      )->fetchField();
       backdrop_set_message(t('Scan complete: @nodes node(s) processed, @clusters cluster(s) found.', [
         '@nodes'    => $result['total'],
-        '@clusters' => $result['cluster_count'] ?? '?',
+        '@clusters' => $cluster_count,
+      ]));
+    }
+    elseif (module_exists('ai_async')) {
+      // Hand the remaining batches to the self-chaining async callback so the
+      // scan finishes in the background without further clicks or cron ticks.
+      ai_async_submit('ai_content_audit_async_scan_batch', [
+        'run_id'     => $active['run_id'],
+        'batch_size' => $batch_size,
+      ]);
+      backdrop_set_message(t('Batch processed: @done of @total node(s). The remaining batches will continue in the background.', [
+        '@done'  => $result['processed'],
+        '@total' => $result['total'],
       ]));
     }
     else {
@@ -786,33 +802,9 @@ function ai_content_audit_settings_form($form, &$form_state) {
     '#description' => t('Accepted columns: "Page path and screen class" and "Views" (or "Sessions"). Other columns are ignored.'),
   ];
 
-  $form['assistant'] = [
-    '#type' => 'fieldset',
-    '#title' => t('Assistant'),
-    '#description' => t('When an assistant is configured, cron sends it a trigger prompt and it uses the audit tools to scan and propose actions. Configure assistants at <a href="@url">admin/config/ai/assistants</a>.', ['@url' => url('admin/config/ai/assistants')]),
-  ];
-  $assistant_options = ['' => t('— None (use direct PHP scanner) —')];
-  if (module_exists('ai_assistant')) {
-    $assistant_options += ai_assistant_options();
-  }
-  $form['assistant']['assistant_id'] = [
-    '#type' => 'select',
-    '#title' => t('Content audit assistant'),
-    '#options' => $assistant_options,
-    '#default_value' => $config->get('assistant_id') ?: '',
-  ];
-  $form['assistant']['assistant_prompt'] = [
-    '#type' => 'textarea',
-    '#title' => t('Trigger prompt'),
-    '#description' => t('Sent to the assistant on each cron run.'),
-    '#default_value' => $config->get('assistant_prompt') ?: 'Run a content audit. Use audit_trigger_scan to inventory content. For each top cluster: use audit_get_cluster to see candidates and their lifecycle analysis, use audit_get_node_content to read the actual content (including any ai_content_lifecycle findings), use audit_classify_rot to set the ROT classification (Redundant/Outdated/Trivial), then either use audit_propose_action to recommend an action or audit_propose_edit to draft specific text changes. Lifecycle ai_analysis fields explain what is wrong — use that context when proposing edits.',
-    '#rows' => 4,
-  ];
-
   $form['scan'] = [
     '#type' => 'fieldset',
-    '#title' => t('Direct scanner settings'),
-    '#description' => t('Used when no assistant is configured.'),
+    '#title' => t('Scanner settings'),
   ];
   $form['scan']['cron_enabled'] = [
     '#type' => 'checkbox',
@@ -1017,7 +1009,7 @@ function _ai_content_audit_parse_ga4_csv($filepath) {
   $path_col    = NULL;
   $views_col   = NULL;
 
-  while (($row = fgetcsv($handle)) !== FALSE) {
+  while (($row = fgetcsv($handle, 0, ',', '"', '\\')) !== FALSE) {
     if (empty($row) || (count($row) === 1 && trim($row[0]) === '')) {
       // Blank line — if we already started reading data, stop.
       if ($header !== NULL) {
