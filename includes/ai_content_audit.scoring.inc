@@ -93,6 +93,94 @@ function ai_content_audit_recommend_action($similarity_score, $age_score, $compo
 }
 
 /**
+ * Fold per-node lifecycle verdicts into cluster recommendations.
+ *
+ * The lifecycle analyzer marks a node review_status 'analyzed' when its LLM
+ * pass decided the content needs updating (ai_results holds the reasoning).
+ * Clusters that similarity/age alone left at 'review' are upgraded to
+ * 'refresh' when the canonical node is flagged or at least half the members
+ * are — which also makes them eligible for auto-drafted canonical edits,
+ * whose prompt already cites the lifecycle analysis.
+ *
+ * @return int
+ *   Number of clusters upgraded.
+ */
+function ai_content_audit_apply_lifecycle_signals($run_id) {
+  if (!module_exists('ai_content_lifecycle') || !db_table_exists('content_lifecycle')) {
+    return 0;
+  }
+
+  $rows = db_query(
+    'SELECT ca.cluster_id, ca.nid, ca.is_canonical, c.recommended_action
+       FROM {ai_content_audit_candidate} ca
+      INNER JOIN {ai_content_audit_cluster} c ON c.cid = ca.cluster_id
+      WHERE ca.run_id = :rid',
+    [':rid' => $run_id]
+  )->fetchAll(PDO::FETCH_ASSOC);
+  if (empty($rows)) {
+    return 0;
+  }
+
+  $nids = array_values(array_unique(array_map(function ($row) {
+    return (int) $row['nid'];
+  }, $rows)));
+  $flagged_nids = db_query(
+    "SELECT entity_id FROM {content_lifecycle} WHERE entity_type = 'node' AND review_status = 'analyzed' AND entity_id IN (:nids)",
+    [':nids' => $nids]
+  )->fetchCol();
+  if (empty($flagged_nids)) {
+    return 0;
+  }
+  $flagged = array_fill_keys(array_map('intval', $flagged_nids), TRUE);
+
+  $clusters = [];
+  foreach ($rows as $row) {
+    $cid = (int) $row['cluster_id'];
+    if (!isset($clusters[$cid])) {
+      $clusters[$cid] = [
+        'action' => (string) $row['recommended_action'],
+        'members' => 0,
+        'flagged' => 0,
+        'canonical_flagged' => FALSE,
+      ];
+    }
+    $clusters[$cid]['members']++;
+    if (!empty($flagged[(int) $row['nid']])) {
+      $clusters[$cid]['flagged']++;
+      if (!empty($row['is_canonical'])) {
+        $clusters[$cid]['canonical_flagged'] = TRUE;
+      }
+    }
+  }
+
+  $upgraded = 0;
+  foreach ($clusters as $cid => $info) {
+    if ($info['action'] !== 'review' || !$info['flagged']) {
+      continue;
+    }
+    if ($info['canonical_flagged'] || $info['flagged'] * 2 >= $info['members']) {
+      db_update('ai_content_audit_cluster')
+        ->fields([
+          'recommended_action' => 'refresh',
+          'rot_type' => 'outdated',
+          'updated' => REQUEST_TIME,
+        ])
+        ->condition('cid', $cid)
+        ->execute();
+      $upgraded++;
+    }
+  }
+
+  if ($upgraded) {
+    watchdog('ai_content_audit', 'Lifecycle signals upgraded @count cluster(s) to refresh for run @rid.', [
+      '@count' => $upgraded,
+      '@rid' => $run_id,
+    ]);
+  }
+  return $upgraded;
+}
+
+/**
  * Score clusters by traffic using uploaded GA4 data.
  */
 function ai_content_audit_score_traffic($run_id) {
@@ -188,8 +276,15 @@ function ai_content_audit_rank_clusters($run_id) {
       ($row->similarity_score * 0.5) + ($row->age_score * 0.3) + ($row->traffic_score * 0.2),
       4
     );
+    // Re-classify with the real composite. The store-time classification ran
+    // before traffic/composite existed (composite 0.0), which mislabeled every
+    // non-similar cluster as 'trivial'.
     db_update('ai_content_audit_cluster')
-      ->fields(['composite_score' => $composite])
+      ->fields([
+        'composite_score'    => $composite,
+        'rot_type'           => ai_content_audit_rot_classify($row->similarity_score, $row->age_score, $composite),
+        'recommended_action' => ai_content_audit_recommend_action($row->similarity_score, $row->age_score, $composite),
+      ])
       ->condition('cid', $row->cid)
       ->execute();
   }

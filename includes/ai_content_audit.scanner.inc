@@ -77,17 +77,30 @@ function ai_content_audit_start_run($profile = 'default') {
  * Returns array with keys: processed, total, finalized.
  */
 function ai_content_audit_process_batch($run_id, $batch_size = 50) {
+  // Acquire a per-run lock so concurrent workers (the self-chained async job
+  // and the admin submit / cron paths) cannot read the same pending_nids slice
+  // simultaneously. The lock is released as soon as the claim is written to the
+  // DB so the slow Search API calls happen outside the critical section.
+  $lock_name = 'ai_content_audit_batch_' . $run_id;
+  if (!lock_acquire($lock_name)) {
+    return ['processed' => 0, 'total' => 0, 'finalized' => FALSE];
+  }
+
   $run = db_query(
     'SELECT * FROM {ai_content_audit_run} WHERE run_id = :rid',
     [':rid' => $run_id]
   )->fetchAssoc();
 
   if (!$run || $run['status'] !== 'collecting') {
+    lock_release($lock_name);
     return ['processed' => 0, 'total' => 0, 'finalized' => FALSE];
   }
 
-  $pending = $run['pending_nids'] ? unserialize($run['pending_nids']) : [];
+  $pending = $run['pending_nids'] ? unserialize($run['pending_nids'], ['allowed_classes' => FALSE]) : [];
+  $pending = is_array($pending) ? $pending : [];
+
   if (empty($pending)) {
+    lock_release($lock_name);
     ai_content_audit_finalize_run($run_id);
     return [
       'processed' => (int) $run['processed_nodes'],
@@ -96,6 +109,18 @@ function ai_content_audit_process_batch($run_id, $batch_size = 50) {
     ];
   }
 
+  // Splice and persist the claimed batch while still holding the lock so no
+  // other worker can claim the same NIDs.
+  $batch = array_splice($pending, 0, (int) $batch_size);
+  $finalized = empty($pending);
+
+  db_update('ai_content_audit_run')->fields([
+    'pending_nids' => $finalized ? NULL : serialize($pending),
+  ])->condition('run_id', $run_id)->execute();
+
+  lock_release($lock_name);
+
+  // Process the claimed NIDs outside the lock (slow Search API calls).
   $config = config('ai_content_audit.settings');
   $similarity_threshold = (float) ($config->get('similarity_threshold') ?: 0.75);
   $index_id = $config->get('search_api_index') ?: '';
@@ -104,8 +129,6 @@ function ai_content_audit_process_batch($run_id, $batch_size = 50) {
   $bundle_filter_mode = $config->get('bundle_filter_mode') ?: 'exclude';
   $filtered_bundles = array_keys(array_filter($config->get('excluded_bundles') ?: []));
   $all_nodes = ai_content_audit_inventory_nodes($filtered_bundles, $bundle_filter_mode);
-
-  $batch = array_splice($pending, 0, (int) $batch_size);
 
   foreach ($batch as $nid) {
     if (!isset($all_nodes[$nid])) {
@@ -116,11 +139,9 @@ function ai_content_audit_process_batch($run_id, $batch_size = 50) {
   }
 
   $processed = (int) $run['processed_nodes'] + count($batch);
-  $finalized = empty($pending);
 
   db_update('ai_content_audit_run')->fields([
     'processed_nodes' => $processed,
-    'pending_nids'    => $finalized ? NULL : serialize($pending),
   ])->condition('run_id', $run_id)->execute();
 
   if ($finalized) {
@@ -138,6 +159,19 @@ function ai_content_audit_process_batch($run_id, $batch_size = 50) {
  * Finalize a run: build clusters from edges, score, rank, trigger lifecycle.
  */
 function ai_content_audit_finalize_run($run_id) {
+  // Atomically transition status so only the first caller runs finalization;
+  // a concurrent worker that also reaches an empty pending list will find
+  // status != 'collecting' and exit without duplicating cluster/scoring work.
+  $claimed = db_update('ai_content_audit_run')
+    ->fields(['status' => 'finalizing'])
+    ->condition('run_id', $run_id)
+    ->condition('status', 'collecting')
+    ->execute();
+
+  if (!$claimed) {
+    return;
+  }
+
   $run = db_query(
     'SELECT * FROM {ai_content_audit_run} WHERE run_id = :rid',
     [':rid' => $run_id]
@@ -170,7 +204,9 @@ function ai_content_audit_finalize_run($run_id) {
   ai_content_audit_score_traffic($run_id);
   ai_content_audit_rank_clusters($run_id);
 
-  // Trigger lifecycle analysis for every clustered node.
+  // Trigger lifecycle analysis for every clustered node. The async jobs run
+  // after this request, so apply_lifecycle_signals is deferred to a later
+  // cron tick when rows will be in review_status = 'analyzed'.
   _ai_content_audit_trigger_lifecycle($run_id);
 
   // Submit LLM summary jobs via ai_async (one per cluster).

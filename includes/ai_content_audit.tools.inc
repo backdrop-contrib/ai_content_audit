@@ -462,15 +462,60 @@ function ai_content_audit_execute_trigger_scan(array $args) {
 
   $batch_size = min(200, max(10, (int) (!empty($args['batch_size']) ? $args['batch_size'] : 50)));
   $profile = !empty($args['profile']) ? $args['profile'] : 'default';
-  $run_id = ai_content_audit_run_id();
 
-  $result = ai_content_audit_run_scan($run_id, $profile, $batch_size);
+  // Reuse the incremental pipeline: continue the active run if one exists,
+  // otherwise start a new one, then process one batch now. Remaining batches
+  // are handed to the self-chaining ai_async callback when available.
+  // Treat 'finalizing' runs as active so a tool call mid-finalization does
+  // not start a duplicate concurrent run.
+  $active = ai_content_audit_active_run();
+  if (!$active) {
+    $finalizing = db_query(
+      "SELECT * FROM {ai_content_audit_run} WHERE status = 'finalizing' ORDER BY started DESC LIMIT 1"
+    )->fetchAssoc() ?: NULL;
+    if ($finalizing) {
+      return [
+        'run_id'  => $finalizing['run_id'],
+        'status'  => 'finalizing',
+        'message' => 'A scan run is currently finalizing. Check audit_list_runs for status, then audit_list_clusters once complete.',
+      ];
+    }
+  }
+  if ($active) {
+    $run_id = $active['run_id'];
+  }
+  else {
+    $run_id = ai_content_audit_start_run($profile);
+  }
+
+  $result = ai_content_audit_process_batch($run_id, $batch_size);
+
+  if (empty($result['finalized']) && module_exists('ai_async') && function_exists('ai_async_submit')) {
+    ai_async_submit('ai_content_audit_async_scan_batch', [
+      'run_id'     => $run_id,
+      'batch_size' => $batch_size,
+    ]);
+    $message = "Scan started: {$result['processed']} of {$result['total']} node(s) processed; remaining batches continue in the background. Check audit_list_runs for status, then audit_list_clusters once complete.";
+  }
+  elseif (empty($result['finalized'])) {
+    $message = "Batch processed: {$result['processed']} of {$result['total']} node(s). Call audit_trigger_scan again to continue.";
+  }
+  else {
+    $message = 'Scan complete. Use audit_list_clusters to view results.';
+  }
+
+  $cluster_count = (int) db_query(
+    'SELECT cluster_count FROM {ai_content_audit_run} WHERE run_id = :rid',
+    [':rid' => $run_id]
+  )->fetchField();
 
   return [
     'run_id' => $run_id,
-    'node_count' => $result['node_count'],
-    'cluster_count' => $result['cluster_count'],
-    'message' => "Scan complete. Use audit_list_clusters to view results.",
+    'status' => !empty($result['finalized']) ? 'complete' : 'collecting',
+    'processed_nodes' => (int) $result['processed'],
+    'total_nodes' => (int) $result['total'],
+    'cluster_count' => $cluster_count,
+    'message' => $message,
   ];
 }
 
@@ -484,7 +529,7 @@ function ai_content_audit_execute_propose_action(array $args) {
 
   $allowed = ['prune', 'flag_for_review', 'merge', 'review', 'edit_queued', 'ignored', 'dismiss'];
   if (!$acid || !in_array($action, $allowed, TRUE)) {
-    return ['error' => 'acid and valid action (prune, flag_for_review, dismiss) are required.'];
+    return ['error' => 'acid and a valid action (' . implode(', ', $allowed) . ') are required.'];
   }
 
   $candidate = db_query('SELECT * FROM {ai_content_audit_candidate} WHERE acid = :acid', [':acid' => $acid])->fetchAssoc();
@@ -506,7 +551,7 @@ function ai_content_audit_execute_propose_action(array $args) {
     'acid' => $acid,
     'action' => $action,
     'status' => 'proposed',
-    'message' => "Action '$action' proposed. Requires admin approval at admin/config/ai/agents/content-audit/queue before execution.",
+    'message' => "Action '$action' proposed. Requires admin approval at admin/config/ai/content-audit/queue before execution.",
   ];
 }
 
