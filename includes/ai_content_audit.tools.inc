@@ -470,9 +470,16 @@ function ai_content_audit_execute_trigger_scan(array $args) {
   // not start a duplicate concurrent run.
   $active = ai_content_audit_active_run();
   if (!$active) {
-    $active = db_query(
+    $finalizing = db_query(
       "SELECT * FROM {ai_content_audit_run} WHERE status = 'finalizing' ORDER BY started DESC LIMIT 1"
     )->fetchAssoc() ?: NULL;
+    if ($finalizing) {
+      return [
+        'run_id'  => $finalizing['run_id'],
+        'status'  => 'finalizing',
+        'message' => 'A scan run is currently finalizing. Check audit_list_runs for status, then audit_list_clusters once complete.',
+      ];
+    }
   }
   if ($active) {
     $run_id = $active['run_id'];

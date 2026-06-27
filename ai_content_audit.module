@@ -181,7 +181,16 @@ function ai_content_audit_cron() {
     )->fetchField();
     if ($recent_run) {
       module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.scoring');
-      ai_content_audit_apply_lifecycle_signals($recent_run);
+      $upgraded = ai_content_audit_apply_lifecycle_signals($recent_run);
+
+      // When clusters were upgraded (review → refresh), run auto-draft again
+      // so newly eligible clusters get proposals. auto_draft_cluster_edit()
+      // already skips clusters that already have an edit_proposed candidate,
+      // so this re-run is idempotent.
+      if ($upgraded > 0 && module_exists('ai') && $config->get('auto_draft_edits_enabled')) {
+        module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.llm');
+        ai_content_audit_auto_draft_cluster_edits($recent_run);
+      }
     }
   }
 }
