@@ -1,26 +1,36 @@
 # AI Content Audit
 
-AI Content Audit identifies redundant, outdated, and trivial (ROT) content on
-your Backdrop CMS site by clustering semantically similar nodes and scoring them
-for human review. No content is changed until a site administrator approves each
-proposed action.
+AI Content Audit scores every published page for Redundant, Outdated, and
+Trivial (ROT) content, while separately identifying exact duplicate sets. No
+content is changed until a site administrator approves each proposed action.
 
 ## Features
 
-- **Semantic clustering** — groups nodes by topic similarity using vector
-  embeddings from your configured AI search index.
-- **ROT classification** — automatically labels clusters as redundant,
-  outdated, trivial, or a combination based on similarity and age scores.
-- **Composite scoring** — combines similarity, traffic (from uploaded GA4 CSV
-  data), and age into a single priority score for each cluster.
+- **Per-page ROT scoring** — every scanned page receives age, traffic, priority,
+  similarity, and ROT classification data, including pages that do not belong
+  to a duplicate set.
+- **Age and staleness reporting** — the ROT report stores creation-based node
+  age and last-updated age separately from the normalized 0–1 staleness score
+  used for priority, so migration timestamps do not hide legacy content.
+- **Similarity evidence without transitive clusters** — semantic search can
+  identify near-duplicate pages for per-page ROT review, but related pages are
+  not unioned into inferred duplicate groups.
+- **Exact duplicate detection** — groups nodes only when their normalized title
+  and full editable content match exactly. Shared topics, similar titles, and
+  repeated campaign language do not create clusters.
+- **Duplicate prioritization** — combines traffic (from uploaded GA4 CSV data)
+  and age into a priority score for each exact duplicate set.
 - **LLM-generated summaries** — optionally asks an AI model to summarize why
   each cluster is flagged and what action it recommends.
 - **Automatic draft edit proposals** — optionally asks an AI model to draft
   updates on canonical pages for merge/refresh clusters and saves them as
   approval-gated revisions.
 - **Action queue with approval gate** — proposed actions (prune, merge,
-  flag for review, proposed edits) are queued for administrator approval before
-  any node is touched.
+  retire, merge, flag for review, proposed edits) are queued for administrator
+  approval before any node is touched.
+- **Recommendation workflow** — the ROT Scores view can be sorted by
+  recommendation, and each recommendation links to a ROT detail page with a
+  review decision or an Action Queue path.
 - **Draft edit proposals** — an AI agent can save proposed text edits as a
   draft revision so admins can review a diff and approve or reject.
 - **Incremental batch scanning** — large sites are scanned in configurable
@@ -36,15 +46,14 @@ proposed action.
 - Backdrop CMS 1.x
 - [AI module](https://github.com/backdrop-contrib/ai) with at least one
   configured text provider
-- [AI Search](https://github.com/backdrop-contrib/ai) with a configured vector
-  index (required for embedding-based clustering)
+- AI Search is not required for exact duplicate detection. It may still be
+  enabled elsewhere on the site for search and related-content features.
 
 ## Installation
 
-1. Install and enable the AI module and configure a text provider.
-2. Configure an AI Search vector index with your content indexed.
-3. Install and enable this module.
-4. Visit **Admin → Configuration → AI → AI Content Audit** to configure.
+1. Install and enable the AI module if you want AI summaries or agent tools.
+2. Install and enable this module.
+3. Visit **Admin → Configuration → AI → AI Content Audit** to configure.
 
 ## Configuration
 
@@ -52,17 +61,19 @@ Navigate to **Admin → Configuration → AI → AI Content Audit → Settings**
 
 Key settings:
 
-- **AI Search index** — the vector index used to compute node similarity.
-- **Similarity threshold** — minimum score for two nodes to be considered
-  related (0.0–1.0; default 0.75).
+- **Content scope** — choose which content types are included in the scan.
 - **Cron scanning** — enable automatic scans and set the interval and batch
   size.
 - **LLM summary model** — model used to generate cluster summaries (can be
   left empty to skip summaries).
 - **Automatic draft edits** — optional post-scan AI drafting for canonical
   pages in merge/refresh clusters, with a model choice and per-run cap.
-- **Traffic data** — upload a GA4 pageviews CSV to factor traffic into cluster
-  scoring. Nodes with high traffic score lower for pruning.
+- **Individual AI edit suggestions** — from an eligible page's ROT detail,
+  **Suggest AI edit** drafts a revision for that page even when it is not a
+  duplicate. The draft remains pending until an administrator reviews the
+  diff and approves it from the Action Queue.
+- **Traffic data** — upload a GA4 pageviews CSV to factor traffic into duplicate
+  prioritization. Nodes with high traffic score lower for pruning.
 
 ## Usage
 
@@ -72,37 +83,56 @@ Go to **Admin → Configuration → AI → AI Content Audit**. Click **Scan Now*
 to start an incremental scan. Progress is shown on the dashboard. Large sites
 may require multiple cron runs to complete.
 
-The scan produces **clusters** — groups of nodes that are semantically similar.
-Each cluster gets a composite score and a recommended action.
+The scan produces a ROT score for every page. It also produces **duplicate
+sets** only for exact matches. Similarity evidence contributes to the page's
+ROT classification, but semantically related pages are intentionally left out
+of the duplicate/consolidation workflow unless their normalized full content
+matches exactly.
 
 If automatic draft edits are enabled, the module can also stage draft
 revisions on canonical pages for high-value merge/refresh clusters. These are
 saved as `edit_proposed` items with `pending` status and still require
 administrator approval.
 
+From an individual ROT detail page, **Suggest AI edit** uses the page's
+editable source and ROT/lifecycle context to propose a refresh. It does not
+merge pages, choose a canonical page, or publish anything; it creates the
+same approval-gated `edit_proposed` revision used by the duplicate workflow.
+
 ### Reviewing Clusters
 
-Go to **Clusters** to see all identified clusters ordered by composite score.
-Click a cluster to see:
+Go to **ROT Scores** to review every page from the newest scan. Filter by
+Redundant, Outdated, Trivial, or Review. Use the **Recommendation** dropdown
+to show only outcomes such as Retire, Refresh, Prune, Merge, or Review; use
+**Sort by** separately to order the filtered results. Every row links to a
+detail page. Go to
+**Duplicates** to see exact duplicate sets ordered by priority. Click a
+duplicate set to see:
 
 - All member nodes with their individual scores.
-- Which node is the canonical (best) version.
+- The selected working canonical page and the exact duplicate candidates.
 - The LLM-generated summary (if configured).
 - Recommended action for each node.
+
+Historical runs remain available from **Runs**, but the default **Clusters**
+view shows only the newest usable scan. A direct link to an older cluster is
+marked historical so old labels are not mistaken for current findings.
 
 ### Approving Actions
 
 Actions proposed by the scan (or by an AI agent) appear in the **Action Queue**
 tab. This includes pending `edit_proposed` draft revisions, which can be
-reviewed through their diff links before approval. Approved actions are
-executed automatically on the next queue processing run.
+reviewed through their diff links before approval. Select pending items and
+click **Approve selected**, then click **Apply approved** when ready. Approved
+actions are then executed by the queue processor.
 
 Possible actions per candidate node:
 
 | Action | Effect |
 |---|---|
-| `prune` | Unpublishes the node. |
-| `merge` | Redirects the node to the canonical URL (requires Redirect module). |
+| `prune` | Unpublishes an exact duplicate node. |
+| `retire` | Unpublishes a fully stale, very low-traffic legacy page after administrator approval. |
+| `merge` | Sends the node into consolidation review; no node is removed automatically. |
 | `flag_for_review` | Adds a watchdog notice; no structural change. |
 | `edit_proposed` | Applies a saved draft revision after admin approval. |
 | `ignored` | Records the decision; no change to the node. |

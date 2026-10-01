@@ -298,6 +298,147 @@ function ai_content_audit_auto_draft_cluster_edit(array $cluster) {
 }
 
 /**
+ * Generate one draft edit proposal for an individual ROT assessment.
+ *
+ * This is intentionally separate from cluster canonical-page drafting. A ROT
+ * page may be old or trivial without being a duplicate of another page, so it
+ * has no canonical/supporting-page relationship to resolve first.
+ *
+ * @param array $score
+ *   A row from ai_content_audit_node_score.
+ *
+ * @return array
+ *   Result data, or an array containing an error string.
+ */
+function ai_content_audit_auto_draft_node_edit(array $score) {
+  module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.tools');
+
+  $existing = db_query(
+    "SELECT * FROM {ai_content_audit_candidate}
+      WHERE run_id = :run_id AND nid = :nid
+        AND status NOT IN (:statuses)
+      ORDER BY acid DESC LIMIT 1",
+    [
+      ':run_id' => $score['run_id'],
+      ':nid' => (int) $score['nid'],
+      ':statuses' => ['rejected', 'ignored', 'applied', 'failed'],
+    ]
+  )->fetchAssoc();
+
+  if ($existing && $existing['task_type'] === 'edit_proposed' && in_array($existing['status'], ['pending', 'approved'], TRUE)) {
+    return ['error' => 'This page already has a pending AI draft revision.'];
+  }
+
+  $acid = $existing ? (int) $existing['acid'] : 0;
+
+  $node_content = ai_content_audit_execute_get_node_content(['nid' => (int) $score['nid']]);
+  if (!empty($node_content['error']) || empty($node_content['primary_edit_target']['value'])) {
+    return ['error' => 'This page does not have editable text content for an AI draft.'];
+  }
+
+  $target_context = $node_content['primary_edit_target'];
+  $target_field = !empty($node_content['primary_edit_field'])
+    ? $node_content['primary_edit_field']
+    : (!empty($target_context['field_name']) ? $target_context['field_name'] : '');
+  if ($target_field === '') {
+    return ['error' => 'This page does not have a recognized editable text field.'];
+  }
+
+  $prompt = ai_content_audit_build_node_edit_prompt($score, $node_content);
+  $proposal = ai_content_audit_llm_generate_edit($prompt);
+  if (empty($proposal) || empty($proposal['should_draft'])) {
+    return ['error' => 'The configured model declined to propose a substantive edit.'];
+  }
+
+  $proposed_title = isset($proposal['proposed_title']) ? trim($proposal['proposed_title']) : '';
+  $proposed_body = isset($proposal['proposed_body']) ? trim($proposal['proposed_body']) : '';
+  $proposed_summary = isset($proposal['proposed_summary']) ? trim($proposal['proposed_summary']) : '';
+  $reason = isset($proposal['reason']) ? trim($proposal['reason']) : '';
+  $current_title = trim($node_content['title']);
+  $current_body = trim($target_context['value']);
+  $current_summary = !empty($target_context['summary']) ? trim($target_context['summary']) : '';
+
+  if ($proposed_body === '') {
+    return ['error' => 'The model did not return editable body content.'];
+  }
+  if ($proposed_title === '') {
+    $proposed_title = $current_title;
+  }
+  if (
+    ai_content_audit_normalize_text_for_compare($proposed_title) === ai_content_audit_normalize_text_for_compare($current_title) &&
+    ai_content_audit_normalize_text_for_compare($proposed_body) === ai_content_audit_normalize_text_for_compare($current_body) &&
+    ai_content_audit_normalize_text_for_compare($proposed_summary) === ai_content_audit_normalize_text_for_compare($current_summary)
+  ) {
+    return ['error' => 'The model did not propose a meaningful content change.'];
+  }
+  if ($reason === '') {
+    $reason = t('AI-suggested refresh based on the page ROT assessment.');
+  }
+
+  if (!$acid) {
+    $acid = ai_content_audit_queue_rot_candidate($score);
+    if (!$acid) {
+      return ['error' => 'Could not create an editorial queue item for this page.'];
+    }
+  }
+
+  $result = ai_content_audit_execute_propose_edit([
+    'acid' => $acid,
+    'nid' => (int) $score['nid'],
+    'target_context' => $target_context,
+    'target_field' => $target_field,
+    'proposed_title' => $proposed_title,
+    'proposed_body' => $proposed_body,
+    'proposed_summary' => $proposed_summary,
+    'reason' => $reason,
+  ]);
+
+  if (!empty($result['error'])) {
+    return ['error' => $result['error']];
+  }
+
+  return $result;
+}
+
+/**
+ * Build a prompt for drafting an individual ROT-page edit.
+ */
+function ai_content_audit_build_node_edit_prompt(array $score, array $node_content) {
+  $target_field = !empty($node_content['primary_edit_field']) ? $node_content['primary_edit_field'] : 'body';
+  $source = ai_content_audit_extract_edit_source_text($node_content);
+  $lifecycle = !empty($node_content['lifecycle']['ai_analysis'])
+    ? trim($node_content['lifecycle']['ai_analysis'])
+    : 'None';
+  $summary = !empty($node_content['primary_edit_target']['summary'])
+    ? trim($node_content['primary_edit_target']['summary'])
+    : 'None';
+
+  return "You are suggesting a careful editorial refresh for one existing web page.\n"
+    . "Return JSON only with this exact shape:\n"
+    . "{\"should_draft\":true|false,\"proposed_title\":\"...\",\"proposed_body\":\"...\",\"proposed_summary\":\"...\",\"reason\":\"...\"}\n\n"
+    . "Rules:\n"
+    . "- Preserve the page's intent and URL identity.\n"
+    . "- Do not invent facts, dates, names, statistics, or claims.\n"
+    . "- Use only information already present in the source below.\n"
+    . "- If the page cannot be improved confidently, return should_draft false.\n"
+    . "- proposed_body must be the raw value for the editable field only. Do not add admin links, field labels, paragraph wrappers, or markup not present in the source.\n"
+    . "- If the source has no HTML, return plain text with blank lines between paragraphs.\n"
+    . "- Do not make cosmetic-only changes such as whitespace, capitalization, punctuation, or markup.\n"
+    . "- The reason must explain the substantive change in 1-2 sentences.\n\n"
+    . "Page title: {$node_content['title']}\n"
+    . "ROT classification: {$score['rot_type']}\n"
+    . "Recommended action: {$score['recommended_action']}\n"
+    . "Age score: {$score['age_score']}\n"
+    . "Traffic score: {$score['traffic_score']}\n"
+    . "Priority score: {$score['composite_score']}\n"
+    . "Primary editable field: {$target_field}\n"
+    . "Current summary: {$summary}\n"
+    . "Lifecycle analysis: {$lifecycle}\n"
+    . "Editable field source (write proposed_body in this same form):\n"
+    . ai_content_audit_trim_text($source, 6000);
+}
+
+/**
  * Build a prompt for drafting a canonical-page edit.
  */
 function ai_content_audit_build_edit_prompt(array $cluster, array $canonical, array $canonical_content, array $supporting_nodes) {

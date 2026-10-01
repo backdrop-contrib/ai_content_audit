@@ -14,7 +14,7 @@
  *   - audit_get_cluster       — full cluster detail incl. candidate scores.
  *   - audit_list_runs         — recent scan runs.
  *   - audit_trigger_scan      — kick off a scan batch.
- *   - audit_propose_action    — propose prune/merge/flag for one candidate.
+ *   - audit_propose_action    — propose prune/merge/retire/flag for one candidate.
  *   - audit_get_node_content  — read current node fields + lifecycle analysis,
  *                                surface the primary editable target context.
  *   - audit_propose_edit      — save proposed text as a draft revision; for
@@ -162,8 +162,8 @@ function ai_content_audit_ai_tools_definitions() {
               ],
               'action' => [
                 'type' => 'string',
-                'description' => 'Action to propose: prune (unpublish), merge (consolidate into canonical), review (flag for human review), edit_queued (admin will manually edit), ignored (no action needed), dismiss.',
-                'enum' => ['prune', 'flag_for_review', 'merge', 'review', 'edit_queued', 'ignored', 'dismiss'],
+          'description' => 'Action to propose: prune (unpublish), retire (unpublish stale trivial content), merge (consolidate into canonical), review (flag for human review), edit_queued (admin will manually edit), ignored (no action needed), dismiss.',
+          'enum' => ['prune', 'retire', 'flag_for_review', 'merge', 'review', 'edit_queued', 'ignored', 'dismiss'],
               ],
               'reason' => [
                 'type' => 'string',
@@ -330,9 +330,12 @@ function ai_content_audit_execute_list_clusters(array $args) {
     $query->condition('c.run_id', $args['run_id']);
   }
   else {
-    $latest = db_query('SELECT run_id FROM {ai_content_audit_run} WHERE status = :s ORDER BY started DESC LIMIT 1', [':s' => 'complete'])->fetchField();
+    $latest = ai_content_audit_latest_cluster_run_id();
     if ($latest) {
       $query->condition('c.run_id', $latest);
+    }
+    else {
+      $query->condition('c.cid', 0);
     }
   }
 
@@ -527,7 +530,7 @@ function ai_content_audit_execute_propose_action(array $args) {
   $action = !empty($args['action']) ? $args['action'] : '';
   $reason = !empty($args['reason']) ? $args['reason'] : '';
 
-  $allowed = ['prune', 'flag_for_review', 'merge', 'review', 'edit_queued', 'ignored', 'dismiss'];
+  $allowed = ['prune', 'retire', 'flag_for_review', 'merge', 'review', 'edit_queued', 'ignored', 'dismiss'];
   if (!$acid || !in_array($action, $allowed, TRUE)) {
     return ['error' => 'acid and a valid action (' . implode(', ', $allowed) . ') are required.'];
   }
@@ -538,6 +541,12 @@ function ai_content_audit_execute_propose_action(array $args) {
   }
   if ($candidate['is_canonical']) {
     return ['error' => "Cannot propose action on canonical node. Target a duplicate_candidate."];
+  }
+  if ($action === 'merge') {
+    $cluster = ai_content_audit_load_cluster((int) $candidate['cluster_id']);
+    if (empty($cluster['canonical_nid'])) {
+      return ['error' => 'This is a related-content cluster with peer pages. Set an explicit canonical page before proposing a merge. Individual prune or review actions are still allowed.'];
+    }
   }
 
   db_update('ai_content_audit_candidate')->fields([

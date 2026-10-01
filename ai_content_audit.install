@@ -154,7 +154,57 @@ function ai_content_audit_schema() {
     ],
   ];
 
+  $schema['ai_content_audit_node_score'] = ai_content_audit_node_score_schema();
+
   return $schema;
+}
+
+/**
+ * Add per-node ROT assessment storage.
+ */
+function ai_content_audit_update_1005() {
+  if (!db_table_exists('ai_content_audit_node_score')) {
+    db_create_table('ai_content_audit_node_score', ai_content_audit_node_score_schema());
+  }
+}
+
+/**
+ * Add persisted similarity evidence to per-node ROT assessments.
+ */
+function ai_content_audit_update_1006() {
+  if (db_table_exists('ai_content_audit_node_score') && !db_field_exists('ai_content_audit_node_score', 'similarity_score')) {
+    db_add_field('ai_content_audit_node_score', 'similarity_score', [
+      'type' => 'float',
+      'not null' => TRUE,
+      'default' => 0.0,
+    ]);
+  }
+}
+
+/**
+ * Add actual age in months to per-node ROT assessments.
+ */
+function ai_content_audit_update_1007() {
+  if (db_table_exists('ai_content_audit_node_score') && !db_field_exists('ai_content_audit_node_score', 'age_months')) {
+    db_add_field('ai_content_audit_node_score', 'age_months', [
+      'type' => 'float',
+      'not null' => TRUE,
+      'default' => 0.0,
+    ]);
+  }
+}
+
+/**
+ * Add creation-based node age to per-node ROT assessments.
+ */
+function ai_content_audit_update_1008() {
+  if (db_table_exists('ai_content_audit_node_score') && !db_field_exists('ai_content_audit_node_score', 'node_age_months')) {
+    db_add_field('ai_content_audit_node_score', 'node_age_months', [
+      'type' => 'float',
+      'not null' => TRUE,
+      'default' => 0.0,
+    ]);
+  }
 }
 
 /**
