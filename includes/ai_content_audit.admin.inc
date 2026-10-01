@@ -22,9 +22,9 @@
  *   - ai_content_audit_queue_form        — Action queue. Approve / reject
  *                                           pending candidates incl. edit_proposed
  *                                           draft revisions with diff links.
- *   - ai_content_audit_settings_form     — Settings: similarity threshold,
- *                                           cron, LLM model, auto-draft, GA4
- *                                           traffic CSV upload, bundle filter.
+ *   - ai_content_audit_settings_form     — Settings: exact matching, cron,
+ *                                           LLM model, auto-draft, GA4 traffic
+ *                                           CSV upload, bundle filter.
  *
  * Also defines the proposed-edit diff page callback
  * (ai_content_audit_proposed_edit_diff_page) for the per-candidate text diff.
@@ -35,10 +35,11 @@
  */
 function ai_content_audit_dashboard_form($form, &$form_state) {
   $counts = ai_content_audit_cluster_counts();
+  $rot_counts = ai_content_audit_rot_counts();
   $latest_run = db_query('SELECT * FROM {ai_content_audit_run} ORDER BY started DESC LIMIT 1')->fetchAssoc();
 
   $form['intro'] = [
-    '#markup' => '<p>' . t('Finds repetitive and overlapping content clusters. Produces ranked reports for human review before any changes are applied.') . '</p>',
+    '#markup' => '<p>' . t('Finds exact duplicate content sets. Produces ranked reports for human review before any changes are applied.') . '</p>',
   ];
 
   $traffic_uploaded = config_get('ai_content_audit.settings', 'traffic_uploaded');
@@ -68,13 +69,30 @@ function ai_content_audit_dashboard_form($form, &$form_state) {
 
   $form['cluster_counts'] = [
     '#theme' => 'table',
-    '#header' => [t('Review State'), t('Clusters')],
+    '#header' => [t('Review State'), t('Duplicate Sets')],
     '#rows' => [
       [t('Pending'), isset($counts['pending']) ? $counts['pending'] : 0],
       [t('Dismissed'), isset($counts['dismissed']) ? $counts['dismissed'] : 0],
       [t('Actioned'), isset($counts['actioned']) ? $counts['actioned'] : 0],
     ],
-    '#empty' => t('No clusters yet. Run a scan.'),
+    '#empty' => t('No exact duplicate sets in the current scan.'),
+  ];
+
+  $form['rot_counts'] = [
+    '#theme' => 'table',
+    '#caption' => t('ROT classifications'),
+    '#header' => [t('Classification'), t('Pages')],
+    '#rows' => [
+      [l(t('Redundant'), 'admin/config/ai/content-audit/rot', ['query' => ['rot' => 'redundant']]), isset($rot_counts['redundant']) ? $rot_counts['redundant'] : 0],
+      [l(t('Redundant + Outdated'), 'admin/config/ai/content-audit/rot', ['query' => ['rot' => 'redundant_outdated']]), isset($rot_counts['redundant_outdated']) ? $rot_counts['redundant_outdated'] : 0],
+      [l(t('Outdated'), 'admin/config/ai/content-audit/rot', ['query' => ['rot' => 'outdated']]), isset($rot_counts['outdated']) ? $rot_counts['outdated'] : 0],
+      [l(t('Trivial'), 'admin/config/ai/content-audit/rot', ['query' => ['rot' => 'trivial']]), isset($rot_counts['trivial']) ? $rot_counts['trivial'] : 0],
+      [l(t('Review'), 'admin/config/ai/content-audit/rot', ['query' => ['rot' => 'review']]), isset($rot_counts['review']) ? $rot_counts['review'] : 0],
+    ],
+    '#empty' => t('No ROT scores yet. Run a scan.'),
+  ];
+  $form['rot_guide'] = [
+    '#markup' => ai_content_audit_rot_guide_markup(),
   ];
 
   // Show in-progress scan status if a run is collecting.
@@ -111,36 +129,62 @@ function ai_content_audit_dashboard_form($form, &$form_state) {
     ];
   }
 
-  $top_clusters = db_query(
-    'SELECT c.*, r.started FROM {ai_content_audit_cluster} c
-     LEFT JOIN {ai_content_audit_run} r ON r.run_id = c.run_id
-     WHERE c.review_state = :state
-     ORDER BY c.composite_score DESC LIMIT 10',
-    [':state' => 'pending']
-  )->fetchAllAssoc('cid', PDO::FETCH_ASSOC);
-
-  $live_counts = ai_content_audit_live_cluster_counts(array_keys($top_clusters));
+  $latest_cluster_run = ai_content_audit_latest_cluster_run_id();
+  $top_rot = $latest_cluster_run && db_table_exists('ai_content_audit_node_score')
+    ? db_query(
+      'SELECT * FROM {ai_content_audit_node_score}
+        WHERE run_id = :run_id
+        ORDER BY composite_score DESC, age_score DESC, nid ASC
+        LIMIT 10',
+      [':run_id' => $latest_cluster_run]
+    )->fetchAll(PDO::FETCH_ASSOC)
+    : [];
   $rows = [];
-  foreach ($top_clusters as $cluster) {
-    $live = isset($live_counts[$cluster['cid']]) ? (int) $live_counts[$cluster['cid']] : 0;
+  foreach ($top_rot as $score) {
     $rows[] = [
-      l(check_plain($cluster['topic_label']), 'admin/config/ai/content-audit/clusters/' . $cluster['cid']),
-      $live,
-      round($cluster['composite_score'], 2),
-      check_plain($cluster['recommended_action']),
-      $cluster['started'] ? format_date($cluster['started'], 'short') : '',
+      l(check_plain($score['title']) . ' #' . (int) $score['nid'], 'admin/config/ai/content-audit/rot/' . (int) $score['sid']),
+      check_plain($score['rot_type']),
+      round($score['composite_score'], 3),
+      check_plain($score['recommended_action']),
     ];
   }
 
   $form['top_clusters'] = [
     '#theme' => 'table',
-    '#caption' => t('Top pending clusters by score'),
-    '#header' => [t('Topic'), t('Pages'), '<abbr title="' . t('Composite priority score 0–1: Similarity 50% + Age 30% + Traffic 20%. Higher = more urgent.') . '">' . t('Score') . '</abbr>', t('Action'), t('Run date')],
+    '#caption' => t('Top ROT pages by priority'),
+    '#header' => [t('Page'), t('ROT'), t('Priority'), t('Recommendation')],
     '#rows' => $rows,
-    '#empty' => t('No pending clusters.'),
+    '#empty' => t('No ROT scores yet.'),
   ];
 
   return $form;
+}
+
+/**
+ * Explain the ROT classifications and score columns in administrator-facing UI.
+ */
+function ai_content_audit_rot_guide_markup() {
+  $definitions = [
+    [t('Redundant'), t('High-similarity pages that may cover the same content. Semantic matches stay review-only; exact matches appear in Duplicates.')],
+    [t('Redundant + Outdated'), t('High-similarity pages where the content is also stale according to the configured staleness curve.')],
+    [t('Outdated'), t('Content whose last update is old enough to need a freshness review, without enough similarity evidence to call it redundant.')],
+    [t('Trivial'), t('Short, low-substance content that is not sufficiently similar to another page.')],
+    [t('Review'), t('No decisive ROT signal. An editor should inspect the page and decide whether to keep, refresh, merge, or retire it.')],
+  ];
+  $items = '';
+  foreach ($definitions as $definition) {
+    $items .= '<dt>' . check_plain($definition[0]) . '</dt><dd>' . check_plain($definition[1]) . '</dd>';
+  }
+
+  return '<details class="ai-content-audit-rot-guide" style="margin:1em 0">'
+    . '<summary>' . t('What do the ROT classifications mean?') . '</summary>'
+    . '<dl>' . $items . '</dl>'
+    . '<p><strong>' . t('Node age') . ':</strong> ' . t('Time since the node was created, shown in months.') . '<br>'
+    . '<strong>' . t('Last updated') . ':</strong> ' . t('Time since the node was last changed, shown in months.') . '<br>'
+    . '<strong>' . t('Staleness') . ':</strong> ' . t('A normalized 0–1 urgency score used by classification and priority; it is not the page age itself.') . '<br>'
+    . '<strong>' . t('Similarity') . ':</strong> ' . t('The strongest available content match from the configured search index.') . '</p>'
+    . '<p><strong>' . t('Retire recommendation') . ':</strong> ' . t('Created at least 10 years ago, fully stale, very low traffic, and not flagged as a duplicate. Retirement always requires administrator approval.') . '</p>'
+    . '</details>';
 }
 
 /**
@@ -263,10 +307,311 @@ function ai_content_audit_runs_form($form, &$form_state) {
 }
 
 /**
+ * Per-node ROT score list.
+ */
+function ai_content_audit_rot_scores_form($form, &$form_state) {
+  $rot_filter = !empty($_GET['rot']) ? $_GET['rot'] : 'all';
+  $recommendation_filter = !empty($_GET['recommendation']) ? $_GET['recommendation'] : 'all';
+  $sort_key = !empty($_GET['rot_sort']) ? $_GET['rot_sort'] : 'priority';
+  $sort_direction = !empty($_GET['rot_dir']) ? strtolower($_GET['rot_dir']) : 'desc';
+  $sort_options = [
+    'priority' => t('Priority'),
+    'recommended_action' => t('Recommendation'),
+    'similarity_score' => t('Similarity'),
+    'node_age_months' => t('Node age'),
+    'age_months' => t('Last updated'),
+    'age_score' => t('Staleness'),
+    'traffic_score' => t('Traffic'),
+    'title' => t('Page'),
+  ];
+  $sort_fields = [
+    'priority' => 's.composite_score',
+    'recommended_action' => 's.recommended_action',
+    'similarity_score' => 's.similarity_score',
+    'node_age_months' => 's.node_age_months',
+    'age_months' => 's.age_months',
+    'age_score' => 's.age_score',
+    'traffic_score' => 's.traffic_score',
+    'title' => 's.title',
+  ];
+  if (!isset($sort_fields[$sort_key])) {
+    $sort_key = 'priority';
+  }
+  if (!in_array($sort_direction, ['asc', 'desc'], TRUE)) {
+    $sort_direction = 'desc';
+  }
+  $run_id = ai_content_audit_latest_cluster_run_id();
+
+  $form['rot_guide'] = [
+    '#markup' => ai_content_audit_rot_guide_markup(),
+  ];
+
+  $form['filter'] = [
+    '#type' => 'select',
+    '#title' => t('ROT classification'),
+    '#options' => [
+      'all' => t('All pages'),
+      'redundant' => t('Redundant'),
+      'redundant_outdated' => t('Redundant + Outdated'),
+      'outdated' => t('Outdated'),
+      'trivial' => t('Trivial'),
+      'review' => t('Review'),
+    ],
+    '#default_value' => $rot_filter,
+    '#attributes' => ['onchange' => 'this.form.submit()'],
+  ];
+  $form['filter_submit'] = [
+    '#type' => 'submit',
+    '#value' => t('Filter'),
+    '#attributes' => ['class' => ['element-invisible']],
+  ];
+  $form['recommendation'] = [
+    '#type' => 'select',
+    '#title' => t('Recommendation'),
+    '#options' => [
+      'all' => t('All recommendations'),
+      'retire' => t('Retire'),
+      'refresh' => t('Refresh'),
+      'prune' => t('Prune'),
+      'merge' => t('Merge'),
+      'review' => t('Review'),
+    ],
+    '#default_value' => $recommendation_filter,
+    '#attributes' => ['onchange' => 'this.form.submit()'],
+  ];
+  $form['sort'] = [
+    '#type' => 'select',
+    '#title' => t('Sort by'),
+    '#options' => $sort_options,
+    '#default_value' => $sort_key,
+    '#attributes' => ['onchange' => 'this.form.submit()'],
+  ];
+  $form['sort_direction'] = [
+    '#type' => 'select',
+    '#title' => t('Order'),
+    '#options' => [
+      'desc' => t('Highest / Z-A first'),
+      'asc' => t('Lowest / A-Z first'),
+    ],
+    '#default_value' => $sort_direction,
+    '#attributes' => ['onchange' => 'this.form.submit()'],
+  ];
+  $form['#submit'][] = 'ai_content_audit_rot_scores_form_submit';
+
+  $header = [
+    ['data' => t('Page'), 'field' => 's.title'],
+    ['data' => t('Type'), 'field' => 's.bundle'],
+    ['data' => t('ROT'), 'field' => 's.rot_type'],
+    ['data' => t('Similarity'), 'field' => 's.similarity_score'],
+    ['data' => t('Node age (months)'), 'field' => 's.node_age_months'],
+    ['data' => t('Last updated (months)'), 'field' => 's.age_months'],
+    ['data' => t('Staleness'), 'field' => 's.age_score'],
+    ['data' => t('Traffic'), 'field' => 's.traffic_score'],
+    ['data' => t('Priority'), 'field' => 's.composite_score'],
+    ['data' => t('Recommendation'), 'field' => 's.recommended_action'],
+    ['data' => t('Status'), 'field' => 's.review_state'],
+  ];
+  $rows = [];
+  if ($run_id && db_table_exists('ai_content_audit_node_score')) {
+    $query = db_select('ai_content_audit_node_score', 's')
+      ->fields('s')
+      ->condition('s.run_id', $run_id)
+      ->orderBy($sort_fields[$sort_key], $sort_direction)
+      ->orderBy($sort_key === 'title' ? 's.nid' : 's.title', 'ASC')
+      ->range(0, 1000);
+    if ($rot_filter !== 'all') {
+      $query->condition('s.rot_type', $rot_filter);
+    }
+    if ($recommendation_filter !== 'all') {
+      $query->condition('s.recommended_action', $recommendation_filter);
+    }
+    foreach ($query->execute() as $score) {
+      $rows[] = [
+        l(check_plain($score->title) . ' #' . (int) $score->nid, 'admin/config/ai/content-audit/rot/' . (int) $score->sid),
+        check_plain($score->bundle),
+        check_plain($score->rot_type),
+        round($score->similarity_score, 3),
+        round($score->node_age_months, 1),
+        round($score->age_months, 1),
+        round($score->age_score, 3),
+        round($score->traffic_score, 3),
+        round($score->composite_score, 3),
+        check_plain($score->recommended_action),
+        check_plain($score->review_state),
+      ];
+    }
+  }
+
+  $form['context'] = [
+    '#markup' => $run_id
+      ? '<p class="description">' . t('Every published page receives a ROT classification from the newest completed scan. Exact duplicate membership is shown separately on the Duplicates tab.') . '</p>'
+      : '<p class="description">' . t('No completed scan results are available yet.') . '</p>',
+  ];
+  $form['scores'] = [
+    '#theme' => 'table',
+    '#header' => $header,
+    '#rows' => $rows,
+    '#empty' => t('No pages match this ROT filter.'),
+  ];
+  return $form;
+}
+
+/**
+ * Detail form for one per-node ROT assessment.
+ */
+function ai_content_audit_rot_detail_form($form, &$form_state, $sid) {
+  $score = db_query(
+    'SELECT * FROM {ai_content_audit_node_score} WHERE sid = :sid',
+    [':sid' => (int) $sid]
+  )->fetchAssoc();
+  if (!$score) {
+    backdrop_set_message(t('ROT assessment not found.'), 'error');
+    backdrop_goto('admin/config/ai/content-audit/rot');
+  }
+
+  $node = node_load((int) $score['nid']);
+  $form['summary'] = [
+    '#markup' => '<h2>' . check_plain($score['title']) . '</h2>'
+      . '<p>' . l(t('View published node'), 'node/' . (int) $score['nid'], ['attributes' => ['target' => '_blank']])
+      . ' · ' . ($node ? l(t('Edit node'), 'node/' . (int) $score['nid'] . '/edit', ['attributes' => ['target' => '_blank']]) : t('Node no longer exists.')) . '</p>'
+      . '<dl>'
+      . '<dt>' . t('ROT classification') . '</dt><dd><strong>' . check_plain($score['rot_type']) . '</strong></dd>'
+      . '<dt>' . t('Similarity score') . '</dt><dd>' . round($score['similarity_score'], 3) . '</dd>'
+      . '<dt>' . t('Node age') . '</dt><dd>' . round($score['node_age_months'], 1) . ' ' . t('months') . '</dd>'
+      . '<dt>' . t('Last updated') . '</dt><dd>' . round($score['age_months'], 1) . ' ' . t('months') . '</dd>'
+      . '<dt>' . t('Staleness score') . '</dt><dd>' . round($score['age_score'], 3) . '</dd>'
+      . '<dt>' . t('Traffic score') . '</dt><dd>' . round($score['traffic_score'], 3) . '</dd>'
+      . '<dt>' . t('ROT priority') . '</dt><dd>' . round($score['composite_score'], 3) . '</dd>'
+      . '<dt>' . t('Recommendation') . '</dt><dd>' . check_plain($score['recommended_action']) . '</dd>'
+      . '<dt>' . t('Status') . '</dt><dd>' . check_plain($score['review_state']) . '</dd>'
+      . '</dl>',
+  ];
+  $form['#rot_score'] = $score;
+  $form['actions'] = ['#type' => 'actions'];
+  $form['actions']['suggest_ai_edit'] = [
+    '#type' => 'submit',
+    '#value' => t('Suggest AI edit'),
+    '#op' => 'suggest_ai_edit',
+    '#access' => !in_array($score['rot_type'], ['redundant', 'redundant_outdated'], TRUE),
+  ];
+  $form['actions']['mark_editing'] = [
+    '#type' => 'submit',
+    '#value' => t('Mark for editing'),
+    '#op' => 'mark_editing',
+  ];
+  $form['actions']['queue_prune'] = [
+    '#type' => 'submit',
+    '#value' => t('Queue prune for approval'),
+    '#op' => 'queue_prune',
+    '#access' => $score['recommended_action'] === 'prune',
+  ];
+  $form['actions']['queue_merge'] = [
+    '#type' => 'submit',
+    '#value' => t('Queue merge for approval'),
+    '#op' => 'queue_merge',
+    '#access' => $score['recommended_action'] === 'merge',
+  ];
+  $form['actions']['retire'] = [
+    '#type' => 'submit',
+    '#value' => t('Queue retire for approval'),
+    '#op' => 'retire',
+    '#access' => $score['recommended_action'] === 'retire',
+  ];
+  $form['actions']['keep_review'] = [
+    '#type' => 'submit',
+    '#value' => t('Keep for review'),
+    '#op' => 'keep_review',
+  ];
+  $form['actions']['ignore'] = [
+    '#type' => 'submit',
+    '#value' => t('Ignore'),
+    '#op' => 'ignore',
+  ];
+  $form['actions']['reset'] = [
+    '#type' => 'submit',
+    '#value' => t('Reset status'),
+    '#op' => 'reset',
+  ];
+  return $form;
+}
+
+/**
+ * Save a ROT assessment review decision.
+ */
+function ai_content_audit_rot_detail_form_submit($form, &$form_state) {
+  $score = $form['#rot_score'];
+  $op = !empty($form_state['triggering_element']['#op']) ? $form_state['triggering_element']['#op'] : '';
+
+  if ($op === 'suggest_ai_edit') {
+    module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.llm');
+    $result = ai_content_audit_auto_draft_node_edit($score);
+    if (!empty($result['error'])) {
+      backdrop_set_message(t('No AI draft revision was created: @message', ['@message' => $result['error']]), 'warning');
+    }
+    else {
+      db_update('ai_content_audit_node_score')
+        ->fields(['review_state' => 'actioned', 'updated' => REQUEST_TIME])
+        ->condition('sid', (int) $score['sid'])
+        ->execute();
+      backdrop_set_message(t('AI draft revision proposed. Review the diff and approve it from the Action Queue.'));
+    }
+    $form_state['redirect'] = 'admin/config/ai/content-audit/rot/' . (int) $score['sid'];
+    return;
+  }
+
+  $state = 'pending';
+  if ($op === 'mark_editing') {
+    ai_content_audit_queue_rot_candidate($score);
+    $state = 'actioned';
+    backdrop_set_message(t('Page marked for editing and added to the Action Queue.'));
+  }
+  elseif ($op === 'retire') {
+    ai_content_audit_queue_rot_candidate($score, 'retire');
+    $state = 'actioned';
+    backdrop_set_message(t('Retire action queued for approval in the Action Queue.'));
+  }
+  elseif ($op === 'queue_prune' || $op === 'queue_merge') {
+    $task_type = $op === 'queue_prune' ? 'prune' : 'merge';
+    ai_content_audit_queue_rot_candidate($score, $task_type);
+    $state = 'actioned';
+    backdrop_set_message(t('@action action queued for approval in the Action Queue.', ['@action' => ucfirst($task_type)]));
+  }
+  elseif ($op === 'ignore') {
+    $state = 'dismissed';
+  }
+  elseif ($op === 'keep_review') {
+    $state = 'pending';
+  }
+  db_update('ai_content_audit_node_score')
+    ->fields(['review_state' => $state, 'updated' => REQUEST_TIME])
+    ->condition('sid', (int) $score['sid'])
+    ->execute();
+  if ($op !== 'mark_editing') {
+    backdrop_set_message(t('ROT assessment status updated.'));
+  }
+  $form_state['redirect'] = 'admin/config/ai/content-audit/rot';
+}
+
+/**
+ * Preserve the ROT filter in the URL after the auto-submit.
+ */
+function ai_content_audit_rot_scores_form_submit($form, &$form_state) {
+  $rot = !empty($form_state['values']['filter']) ? $form_state['values']['filter'] : 'all';
+  $recommendation = !empty($form_state['values']['recommendation']) ? $form_state['values']['recommendation'] : 'all';
+  $sort = !empty($form_state['values']['sort']) ? $form_state['values']['sort'] : 'priority';
+  $direction = !empty($form_state['values']['sort_direction']) ? $form_state['values']['sort_direction'] : 'desc';
+  $form_state['redirect'] = [
+    'admin/config/ai/content-audit/rot',
+    ['query' => ['rot' => $rot, 'recommendation' => $recommendation, 'rot_sort' => $sort, 'rot_dir' => $direction]],
+  ];
+}
+
+/**
  * Clusters list form.
  */
 function ai_content_audit_clusters_form($form, &$form_state) {
   $review_state = !empty($_GET['state']) ? $_GET['state'] : 'pending';
+  $selected_run_id = !empty($_GET['run_id']) ? trim($_GET['run_id']) : ai_content_audit_latest_cluster_run_id();
 
   $form['filter'] = [
     '#type' => 'select',
@@ -281,6 +626,12 @@ function ai_content_audit_clusters_form($form, &$form_state) {
   ];
   $form['filter_submit'] = ['#type' => 'submit', '#value' => t('Filter'), '#attributes' => ['class' => ['element-invisible']]];
 
+  $form['run_context'] = [
+    '#markup' => $selected_run_id
+      ? '<p class="description">' . t('Showing results from the newest usable scan. Historical scan results remain available from the Runs tab.') . '</p>'
+      : '<p class="description">' . t('No completed scan results are available yet.') . '</p>',
+  ];
+
   $header = [
     ['data' => t('Topic'),      'field' => 'c.topic_label'],
     ['data' => t('Pages'),      'field' => 'c.source_count'],
@@ -288,7 +639,7 @@ function ai_content_audit_clusters_form($form, &$form_state) {
     ['data' => t('Similarity'), 'field' => 'c.similarity_score'],
     ['data' => t('Age'),        'field' => 'c.age_score'],
     ['data' => t('Traffic'),    'field' => 'c.traffic_score'],
-    ['data' => t('Score'),      'field' => 'c.composite_score', 'sort' => 'desc'],
+    ['data' => t('Priority'),   'field' => 'c.composite_score', 'sort' => 'desc'],
     ['data' => t('Action'),     'field' => 'c.recommended_action'],
     ['data' => t('Scan date'),  'field' => 'r.started'],
   ];
@@ -298,6 +649,13 @@ function ai_content_audit_clusters_form($form, &$form_state) {
   $query->fields('c');
   $query->addField('r', 'started', 'run_started');
   $query->condition('c.review_state', $review_state);
+  if ($selected_run_id) {
+    $query->condition('c.run_id', $selected_run_id);
+  }
+  else {
+    // Prevent a missing current run from falling back to historical rows.
+    $query->condition('c.cid', 0);
+  }
   $query->orderByHeader($header);
   $query->range(0, 100);
   $clusters = $query->execute()->fetchAllAssoc('cid', PDO::FETCH_ASSOC);
@@ -330,13 +688,13 @@ function ai_content_audit_clusters_form($form, &$form_state) {
   }
 
   $form['score_legend'] = [
-    '#markup' => '<details style="margin-bottom:1em"><summary>' . t('Score &amp; ROT column guide') . '</summary><dl>'
-      . '<dt>' . t('ROT') . '</dt><dd>' . t('<strong>Redundant</strong> = near-identical content, both recent — consolidate or prune. <strong>Outdated</strong> = same topic but pages span years — the older page may need updating or archiving. <strong>Trivial</strong> = loosely related, low value — low priority. <strong>Redundant+Outdated</strong> = duplicate AND stale — strong prune candidate.') . '</dd>'
-      . '<dt>' . t('Similarity (0–1)') . '</dt><dd>' . t('How alike the pages are. 1.0 = near-identical; 0.5 = loosely related.') . '</dd>'
-      . '<dt>' . t('Age (0–1)') . '</dt><dd>' . t('Fraction of pages last updated more than 2 years ago. 1.0 = all stale.') . '</dd>'
+    '#markup' => '<details style="margin-bottom:1em"><summary>' . t('Priority &amp; ROT column guide') . '</summary><dl>'
+      . '<dt>' . t('ROT') . '</dt><dd>' . t('<strong>Redundant</strong> = high-similarity content; semantic matches remain review-only. <strong>Outdated</strong> = old content without enough similarity evidence to call it redundant. <strong>Trivial</strong> = short, low-substance content. <strong>Redundant + Outdated</strong> = high similarity plus staleness.') . '</dd>'
+      . '<dt>' . t('Similarity (0–1)') . '</dt><dd>' . t('Highest content-match score found for the page. Exact-content duplicate clusters score 1.0.') . '</dd>'
+      . '<dt>' . t('Staleness (0–1)') . '</dt><dd>' . t('Normalized urgency based on last update. It is separate from the actual age shown on ROT Scores.') . '</dd>'
       . '<dt>' . t('Traffic (0–1)') . '</dt><dd>' . t('Normalized GA4 pageviews. 1.0 = highest-traffic cluster.') . '</dd>'
-      . '<dt>' . t('Score (0–1)') . '</dt><dd>' . t('Composite: Similarity 50% + Age 30% + Traffic 20%. Higher = more urgent.') . '</dd>'
-      . '<dt>' . t('Action') . '</dt><dd>' . t('<strong>prune</strong> = unpublish duplicate; <strong>merge</strong> = consolidate; <strong>refresh</strong> = update stale content; <strong>review</strong> = human judgement needed.') . '</dd>'
+      . '<dt>' . t('Priority (0–1)') . '</dt><dd>' . t('Consolidation priority: Similarity + Age + Traffic. Higher = more urgent action needed.') . '</dd>'
+      . '<dt>' . t('Recommendation') . '</dt><dd>' . t('<strong>prune</strong> = unpublish an exact duplicate; <strong>merge</strong> = send an exact duplicate for consolidation review; <strong>refresh</strong> = edit stale content; <strong>retire</strong> = unpublish a fully stale, very low-traffic legacy page after approval; <strong>review</strong> = human judgement needed.') . '</dd>'
       . '</dl></details>',
   ];
 
@@ -396,6 +754,15 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
 
   $form['#cluster'] = $cluster;
 
+  if (ai_content_audit_latest_cluster_run_id() !== (string) $cluster['run_id']) {
+    $form['historical_note'] = [
+      '#markup' => '<div class="messages warning"><strong>' . t('Historical scan result') . ':</strong> '
+        . t('This cluster belongs to an older scan and is not part of the current Clusters view. Its labels are retained for history only.')
+        . '</div>',
+      '#weight' => -100,
+    ];
+  }
+
   $rot_labels = [
     'redundant'          => t('Redundant'),
     'outdated'           => t('Outdated'),
@@ -424,23 +791,45 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
   $rot_badge = '<span style="display:inline-block;padding:3px 10px;border-radius:3px;background:' . $rot_color . ';color:#fff;font-weight:bold;font-size:0.9em;letter-spacing:0.03em">'
     . check_plain($rot_label) . '</span>';
 
+  module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.scoring');
+  $weights = ai_content_audit_get_priority_weights();
+  $weights_label = t('Similarity @sim% + Age @age% + Traffic @traf%', [
+    '@sim' => round($weights['similarity'] * 100),
+    '@age' => round($weights['age'] * 100),
+    '@traf' => round($weights['traffic'] * 100),
+  ]);
+
   $form['meta'] = [
     '#markup' => '<div style="margin-bottom:1em">'
       . '<div style="margin-bottom:0.5em">' . $rot_badge . ' &nbsp; <em>' . $rot_description . '</em></div>'
       . '</div>'
       . '<dl>'
       . '<dt>' . t('Topic') . '</dt><dd>' . check_plain($cluster['topic_label']) . '</dd>'
-      . '<dt>' . t('Recommended action') . '</dt><dd>' . check_plain($cluster['recommended_action'])
+      . '<dt>' . t('Recommended action') . '</dt><dd><strong>' . check_plain($cluster['recommended_action']) . '</strong>'
         . ' <small>(' . t('prune = near-duplicate; merge = overlapping; refresh = stale; review = needs judgement') . ')</small></dd>'
       . '<dt>' . t('Similarity score') . '</dt><dd>' . round($cluster['similarity_score'], 3)
-        . ' <small>(' . t('0–1; how alike the pages are') . ')</small></dd>'
+        . ' <small>(' . t('0–1; semantic similarity within cluster') . ')</small></dd>'
       . '<dt>' . t('Age score') . '</dt><dd>' . round($cluster['age_score'], 3)
-        . ' <small>(' . t('fraction of pages not updated in 2+ years') . ')</small></dd>'
+        . ' <small>(' . t('smooth decay; 0.0 = recent, 1.0 = fully stale') . ')</small></dd>'
       . '<dt>' . t('Traffic score') . '</dt><dd>' . round($cluster['traffic_score'], 3)
         . ' <small>(' . t('normalized GA4 pageviews; requires CSV upload') . ')</small></dd>'
-      . '<dt>' . t('Composite score') . '</dt><dd>' . round($cluster['composite_score'], 3)
-        . ' <small>(' . t('Similarity 50% + Age 30% + Traffic 20%') . ')</small></dd>'
+      . '<dt>' . t('Consolidation priority') . '</dt><dd><strong>' . round($cluster['composite_score'], 3) . '</strong>'
+        . ' <small>(' . $weights_label . '; higher = more urgent action needed)</small></dd>'
       . '</dl>',
+  ];
+
+  $form['canonical_note'] = [
+    '#markup' => !empty($cluster['canonical_nid'])
+      ? '<p><strong>' . t('Working canonical page') . ':</strong> '
+        . t('This is the working page for this exact duplicate set. No content is changed until an administrator approves an action.')
+        . '</p>'
+      : ((float) $cluster['similarity_score'] < 0.999
+        ? '<p><strong>' . t('Historical semantic result') . ':</strong> '
+          . t('This older scan grouped pages by similar wording. It is retained for history only and is not an exact-duplicate finding.')
+          . '</p>'
+        : '<p><strong>' . t('Exact duplicate set') . ':</strong> '
+          . t('These pages have matching normalized titles and editable content. Review the working page and candidates before approving an action.')
+          . '</p>'),
   ];
 
   if (!empty($cluster['llm_summary'])) {
@@ -470,7 +859,6 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
   }
 
   // Load live node data (title + changed) for all nids in the cluster.
-  $two_years = 60 * 60 * 24 * 365 * 2;
   $node_age = [];
   $live_titles = [];
   if (!empty($all_nids)) {
@@ -480,7 +868,7 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
     )->fetchAllAssoc('nid', PDO::FETCH_ASSOC);
     foreach ($node_rows as $nid => $row) {
       $live_titles[(int) $nid] = $row['title'];
-      $node_age[(int) $nid] = (REQUEST_TIME - (int) $row['changed']) > $two_years ? 1.0 : 0.0;
+      $node_age[(int) $nid] = ai_content_audit_node_age_score((int) $row['changed']);
     }
   }
 
@@ -516,13 +904,15 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
     }
   }
 
+  $max_node_traffic = !empty($node_traffic) ? max($node_traffic) : 0;
+
   $options = [];
   foreach ($candidates as $c) {
     $nid = (int) $c['nid'];
     $display_title = isset($live_titles[$nid]) ? $live_titles[$nid] : $c['title'];
     $node_link = l(check_plain($display_title), 'node/' . $nid, ['attributes' => ['target' => '_blank']]);
     $is_canonical = !empty($c['is_canonical']);
-    $nid_label = '<span style="color:#999;font-size:0.85em;margin-left:5px">#' . $nid . '</span>';
+    $nid_label = '<span style="color:var(--gin-color-text-light,#999);font-size:0.85em;margin-left:5px">#' . $nid . '</span>';
     $title_cell = $node_link . $nid_label;
 
     // Add Draft Workflow review links for edit_proposed candidates.
@@ -540,6 +930,16 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
     else {
       $lifecycle = '—';
     }
+
+    $cand_age = isset($node_age[$nid]) ? (float) $node_age[$nid] : 0.0;
+    $node_traffic_norm = ($max_node_traffic > 0 && isset($node_traffic[$nid])) ? ($node_traffic[$nid] / $max_node_traffic) : 0.0;
+    $cand_priority = round(
+      ((float) $c['similarity_score'] * $weights['similarity']) +
+      ($cand_age * $weights['age']) +
+      ($node_traffic_norm * $weights['traffic']),
+      3
+    );
+
     $options[$c['acid']] = [
       $title_cell,
       check_plain($c['bundle']),
@@ -548,7 +948,7 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
       round($c['similarity_score'], 3),
       isset($node_age[$nid]) ? round($node_age[$nid], 3) : '—',
       isset($node_traffic[$nid]) ? number_format($node_traffic[$nid]) : '—',
-      round($cluster['composite_score'], 3),
+      $cand_priority,
       ['data' => $rot_badge],
       check_plain($cluster['recommended_action']),
       ['data' => $lifecycle],
@@ -557,7 +957,7 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
 
   $form['candidates'] = [
     '#type' => 'tableselect',
-    '#header' => [t('Title'), t('Type'), t('Task'), t('Status'), t('Similarity'), t('Age'), t('Traffic'), t('Score'), t('ROT'), t('Action'), t('Lifecycle')],
+    '#header' => [t('Title'), t('Type'), t('Task'), t('Status'), t('Similarity'), t('Age'), t('Traffic'), t('Priority'), t('ROT'), t('Action'), t('Lifecycle')],
     '#options' => $options,
     '#empty' => t('No candidates.'),
   ];
@@ -577,6 +977,7 @@ function ai_content_audit_cluster_detail_form($form, &$form_state, $cid) {
     '#type' => 'submit',
     '#value' => t('Propose AI edit'),
     '#op' => 'propose_ai_edit',
+    '#access' => !empty($cluster['canonical_nid']) && in_array($cluster['recommended_action'], ['merge', 'refresh'], TRUE),
   ];
   $form['actions']['ignore'] = [
     '#type' => 'submit',
@@ -631,11 +1032,38 @@ function ai_content_audit_cluster_detail_form_submit($form, &$form_state) {
     module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.llm');
     module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.tools');
     $cluster = ai_content_audit_load_cluster($cid);
+    if (!$cluster || !in_array($cluster['recommended_action'], ['merge', 'refresh'], TRUE)) {
+      backdrop_set_message(t('AI edits are limited to clusters with a merge or refresh recommendation. This cluster is still for human review.'), 'warning');
+      $form_state['redirect'] = 'admin/config/ai/content-audit/clusters/' . $cid;
+      return;
+    }
     if ($cluster && ai_content_audit_auto_draft_cluster_edit($cluster)) {
       backdrop_set_message(t('AI draft revision proposed for the canonical page. Review the diff and approve it from the queue or this cluster view.'));
     }
     else {
       backdrop_set_message(t('No AI draft revision was created for this cluster. The canonical page may lack editable body content, already have a pending draft, or the model may have declined to propose changes.'), 'warning');
+    }
+    $form_state['redirect'] = 'admin/config/ai/content-audit/clusters/' . $cid;
+    return;
+  }
+
+  if ($op === 'set_canonical') {
+    $selected = [];
+    if (!empty($form_state['values']['candidates']) && is_array($form_state['values']['candidates'])) {
+      foreach ($form_state['values']['candidates'] as $acid => $checked) {
+        if ($checked) {
+          $selected[] = (int) $acid;
+        }
+      }
+    }
+    if (count($selected) !== 1) {
+      backdrop_set_message(t('Select exactly one candidate to set as canonical.'), 'warning');
+    }
+    elseif (ai_content_audit_set_canonical($cid, $selected[0])) {
+      backdrop_set_message(t('Canonical page updated.'));
+    }
+    else {
+      backdrop_set_message(t('The canonical page could not be changed. Reject or apply any existing AI draft before switching it.'), 'warning');
     }
     $form_state['redirect'] = 'admin/config/ai/content-audit/clusters/' . $cid;
     return;
@@ -694,7 +1122,7 @@ function ai_content_audit_queue_form($form, &$form_state) {
      ORDER BY ca.updated DESC LIMIT 200',
     [
       ':pending_status' => 'pending',
-      ':scan_types'     => ['canonical', 'duplicate_candidate'],
+    ':scan_types'     => ['canonical', 'duplicate_candidate', 'related'],
       ':statuses'       => ['approved', 'applied', 'rejected', 'failed', 'edit_queued', 'ignored'],
     ]
   )->fetchAllAssoc('acid', PDO::FETCH_ASSOC);
@@ -718,7 +1146,7 @@ function ai_content_audit_queue_form($form, &$form_state) {
       ['data' => $status_display],
       check_plain($c['task_type']),
       $node_link,
-      check_plain($c['topic_label']),
+      check_plain($c['topic_label'] ?: t('Individual ROT assessment')),
       format_date($c['updated'], 'short'),
     ];
   }
@@ -731,6 +1159,11 @@ function ai_content_audit_queue_form($form, &$form_state) {
   ];
 
   $form['actions'] = ['#type' => 'actions'];
+  $form['actions']['approve'] = [
+    '#type' => 'submit',
+    '#value' => t('Approve selected'),
+    '#op' => 'approve',
+  ];
   $form['actions']['apply'] = [
     '#type' => 'submit',
     '#value' => t('Apply approved'),
@@ -760,7 +1193,29 @@ function ai_content_audit_queue_form_submit($form, &$form_state) {
     }
   }
 
-  if ($op === 'apply') {
+  if ($op === 'approve' && $selected) {
+    $approvable = db_query(
+      'SELECT acid FROM {ai_content_audit_candidate}
+       WHERE acid IN (:acids) AND status = :status
+         AND task_type NOT IN (:scan_types)',
+      [
+        ':acids' => $selected,
+        ':status' => 'pending',
+        ':scan_types' => ['canonical', 'duplicate_candidate', 'related'],
+      ]
+    )->fetchCol();
+    if ($approvable) {
+      ai_content_audit_update_candidate_status($approvable, 'approved', $GLOBALS['user']->uid);
+      backdrop_set_message(t('Approved @count action(s). Apply them when ready.', ['@count' => count($approvable)]));
+    }
+    else {
+      backdrop_set_message(t('The selected items are not pending approval.'), 'warning');
+    }
+  }
+  elseif ($op === 'approve') {
+    backdrop_set_message(t('Select at least one pending action to approve.'), 'warning');
+  }
+  elseif ($op === 'apply') {
     $applied = ai_content_audit_apply_approved(count($selected) ?: 10);
     backdrop_set_message(t('Applied @count action(s).', ['@count' => $applied]));
   }
@@ -826,7 +1281,7 @@ function ai_content_audit_settings_form($form, &$form_state) {
   $form['scan']['cron_batch_size'] = [
     '#type' => 'select',
     '#title' => t('Nodes per cron batch'),
-    '#description' => t('How many nodes to similarity-search per cron run. Lower = safer on shared hosting; higher = faster scans.'),
+    '#description' => t('How many nodes to process per cron run. Lower = safer on shared hosting; higher = faster scans.'),
     '#options' => [10 => 10, 25 => 25, 50 => 50, 100 => 100, 200 => 200],
     '#default_value' => $config->get('cron_batch_size') ?: 50,
   ];
@@ -837,25 +1292,12 @@ function ai_content_audit_settings_form($form, &$form_state) {
     '#size' => 32,
   ];
 
-  $form['similarity'] = [
+  $form['matching'] = [
     '#type' => 'fieldset',
-    '#title' => t('Similarity settings'),
+    '#title' => t('Duplicate matching'),
   ];
-  $form['similarity']['similarity_threshold'] = [
-    '#type' => 'textfield',
-    '#title' => t('Similarity threshold (0.0–1.0)'),
-    '#description' => t('Minimum vector similarity score to consider two pages related. 0.75 is a good starting point.'),
-    '#default_value' => $config->get('similarity_threshold') ?: '0.75',
-    '#size' => 8,
-  ];
-
-  $index_options = _ai_content_audit_index_options();
-  $form['similarity']['search_api_index'] = [
-    '#type' => 'select',
-    '#title' => t('Search API AI index'),
-    '#description' => t('Which vector index to use for semantic clustering. Leave empty to search all.'),
-    '#options' => ['' => t('— All available indexes —')] + $index_options,
-    '#default_value' => $config->get('search_api_index') ?: '',
+  $form['matching']['description'] = [
+    '#markup' => '<p>' . t('Scans create clusters only when normalized titles and full editable content match exactly. Similar topics, similar titles, and shared template language are intentionally excluded.') . '</p>',
   ];
 
   $form['content'] = [
@@ -949,10 +1391,84 @@ function ai_content_audit_settings_form($form, &$form_state) {
     ],
   ];
 
+  $form['scoring'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Scoring &amp; Consolidation Priority'),
+    '#description' => t('Configure how urgency is weighted and how age decay is calculated across clusters.'),
+  ];
+  $form['scoring']['weight_similarity'] = [
+    '#type' => 'number',
+    '#title' => t('Similarity weight (%)'),
+    '#description' => t('Weight assigned to semantic and content similarity between pages. Default is 50%.'),
+    '#default_value' => $config->get('weight_similarity') ?? 50,
+    '#min' => 0,
+    '#max' => 100,
+    '#step' => 1,
+  ];
+  $form['scoring']['weight_age'] = [
+    '#type' => 'number',
+    '#title' => t('Age / staleness weight (%)'),
+    '#description' => t('Weight assigned to lack of recent updates. Default is 30%.'),
+    '#default_value' => $config->get('weight_age') ?? 30,
+    '#min' => 0,
+    '#max' => 100,
+    '#step' => 1,
+  ];
+  $form['scoring']['weight_traffic'] = [
+    '#type' => 'number',
+    '#title' => t('Traffic weight (%)'),
+    '#description' => t('Weight assigned to normalized GA4 pageviews. Default is 20%. If no GA4 data has been uploaded, similarity and age weights automatically re-normalize so maximum priority remains 1.0.'),
+    '#default_value' => $config->get('weight_traffic') ?? 20,
+    '#min' => 0,
+    '#max' => 100,
+    '#step' => 1,
+  ];
+  $form['scoring']['decay_start_months'] = [
+    '#type' => 'number',
+    '#title' => t('Decay start threshold (months)'),
+    '#description' => t('Content younger than this has zero age decay (0.0). Default is 6 months.'),
+    '#default_value' => $config->get('decay_start_months') ?? 6,
+    '#min' => 0,
+    '#max' => 60,
+    '#step' => 1,
+  ];
+  $form['scoring']['stale_age_months'] = [
+    '#type' => 'number',
+    '#title' => t('Full staleness threshold (months)'),
+    '#description' => t('Content older than this reaches maximum age decay (1.0). Default is 24 months (2 years).'),
+    '#default_value' => $config->get('stale_age_months') ?? 24,
+    '#min' => 1,
+    '#max' => 120,
+    '#step' => 1,
+  ];
+
   $form['#attributes']['enctype'] = 'multipart/form-data';
   $form = system_settings_form($form);
+  $form['#validate'][] = 'ai_content_audit_settings_form_validate';
   $form['#submit'] = ['ai_content_audit_settings_form_submit'];
   return $form;
+}
+
+/**
+ * Settings form validate handler.
+ */
+function ai_content_audit_settings_form_validate($form, &$form_state) {
+  $w_sim = isset($form_state['values']['weight_similarity']) ? (float) $form_state['values']['weight_similarity'] : 0;
+  $w_age = isset($form_state['values']['weight_age']) ? (float) $form_state['values']['weight_age'] : 0;
+  $w_traf = isset($form_state['values']['weight_traffic']) ? (float) $form_state['values']['weight_traffic'] : 0;
+
+  if ($w_sim < 0 || $w_age < 0 || $w_traf < 0) {
+    form_set_error('weight_similarity', t('Priority weights cannot be negative numbers.'));
+  }
+  if (($w_sim + $w_age + $w_traf) <= 0) {
+    form_set_error('weight_similarity', t('The sum of priority weights must be greater than 0.'));
+  }
+
+  $decay_start = isset($form_state['values']['decay_start_months']) ? (int) $form_state['values']['decay_start_months'] : 6;
+  $stale_age = isset($form_state['values']['stale_age_months']) ? (int) $form_state['values']['stale_age_months'] : 24;
+  if ($decay_start >= $stale_age) {
+    form_set_error('decay_start_months', t('Decay start threshold must be strictly less than the full staleness threshold.'));
+  }
 }
 
 /**
@@ -1215,7 +1731,7 @@ function ai_content_audit_proposed_edit_diff_page($acid) {
     $diag_lines[] = check_plain($k) . ' = ' . check_plain((string) $v);
   }
   $out['meta'] = [
-    '#markup' => '<p style="color:#666;font-size:0.9em">' . implode(' · ', $diag_lines) . '</p>',
+    '#markup' => '<p style="color:var(--gin-color-text-light,#666);font-size:0.9em">' . implode(' · ', $diag_lines) . '</p>',
   ];
 
   // Show the raw extracted source on both sides so you can see what was fed
@@ -1223,9 +1739,9 @@ function ai_content_audit_proposed_edit_diff_page($acid) {
   $out['raw'] = [
     '#markup' => '<details><summary>' . t('Raw extracted text (debug)') . '</summary>'
       . '<h4>' . t('Original (raw value)') . '</h4>'
-      . '<pre style="white-space:pre-wrap;background:#f5f5f5;padding:.5em;max-height:300px;overflow:auto">' . check_plain($original_body) . '</pre>'
+      . '<pre style="white-space:pre-wrap;background:var(--gin-bg-layer2,#f5f5f5);color:var(--gin-color-text,inherit);padding:.5em;max-height:300px;overflow:auto">' . check_plain($original_body) . '</pre>'
       . '<h4>' . t('Proposed (raw value)') . '</h4>'
-      . '<pre style="white-space:pre-wrap;background:#f5f5f5;padding:.5em;max-height:300px;overflow:auto">' . check_plain($proposed_body) . '</pre>'
+      . '<pre style="white-space:pre-wrap;background:var(--gin-bg-layer2,#f5f5f5);color:var(--gin-color-text,inherit);padding:.5em;max-height:300px;overflow:auto">' . check_plain($proposed_body) . '</pre>'
       . '</details>',
   ];
 
@@ -1233,8 +1749,8 @@ function ai_content_audit_proposed_edit_diff_page($acid) {
   if ($original_node->title !== $proposed_node->title) {
     $out['title'] = [
       '#markup' => '<h3>' . t('Title') . '</h3>'
-        . '<div style="padding:.5em;background:#fee;text-decoration:line-through;margin-bottom:.25em">' . check_plain($original_node->title) . '</div>'
-        . '<div style="padding:.5em;background:#efe">' . check_plain($proposed_node->title) . '</div>',
+        . '<div style="padding:.5em;background:var(--gin-status-danger-bg,#fee);color:var(--gin-color-text,inherit);text-decoration:line-through;margin-bottom:.25em">' . check_plain($original_node->title) . '</div>'
+        . '<div style="padding:.5em;background:var(--gin-status-success-bg,#efe);color:var(--gin-color-text,inherit)">' . check_plain($proposed_node->title) . '</div>',
     ];
   }
 
@@ -1249,12 +1765,12 @@ function ai_content_audit_proposed_edit_diff_page($acid) {
     $out['body_nochange'] = ['#markup' => '<p><em>' . t('Body text is identical after stripping markup — proposal contained only formatting/whitespace changes.') . '</em></p>'];
   }
   else {
-    $out['body_heading'] = ['#markup' => '<h3>' . t('Body') . ' <span style="font-weight:normal;color:#666;font-size:.8em">' . t('(inline word diff, markup stripped)') . '</span></h3>'];
+    $out['body_heading'] = ['#markup' => '<h3>' . t('Body') . ' <span style="font-weight:normal;color:var(--gin-color-text-light,#666);font-size:.8em">' . t('(inline word diff, markup stripped)') . '</span></h3>'];
     if (module_exists('diff')) {
       module_load_include('inc', 'diff', 'includes/diff.backdrop_diff_inline');
       $renderer = new BackdropDiffInline($original_text, $proposed_text);
       $out['body_diff'] = [
-        '#markup' => '<div class="diff-inline" style="padding:1em;border:1px solid #ccc;background:#fafafa;white-space:pre-wrap;font-family:inherit;line-height:1.5">' . $renderer->render() . '</div>',
+        '#markup' => '<div class="diff-inline" style="padding:1em;border:1px solid var(--gin-border-color,#ccc);background:var(--gin-bg-layer2,#fafafa);color:var(--gin-color-text,inherit);white-space:pre-wrap;font-family:inherit;line-height:1.5">' . $renderer->render() . '</div>',
         '#attached' => [
           'css' => [
             backdrop_get_path('module', 'diff') . '/css/diff.default.css',
@@ -1265,16 +1781,16 @@ function ai_content_audit_proposed_edit_diff_page($acid) {
       // inline highlight selectors may not be obvious without explicit rules.
       $out['body_diff_css'] = [
         '#markup' => '<style>'
-          . '.diff-inline .diff-added,.diff-inline ins{background:#dfd;text-decoration:none;padding:0 2px}'
-          . '.diff-inline .diff-deleted,.diff-inline del{background:#fdd;text-decoration:line-through;padding:0 2px}'
-          . '.diff-inline .diff-changed{background:#ffd;padding:0 2px}'
+          . '.diff-inline .diff-added,.diff-inline ins{background:var(--gin-status-success-bg,#dfd);text-decoration:none;padding:0 2px}'
+          . '.diff-inline .diff-deleted,.diff-inline del{background:var(--gin-status-danger-bg,#fdd);text-decoration:line-through;padding:0 2px}'
+          . '.diff-inline .diff-changed{background:var(--gin-status-warning-bg,#ffd);padding:0 2px}'
           . '</style>',
       ];
     }
     else {
       $out['body_diff'] = [
-        '#markup' => '<h4>' . t('Original') . '</h4><pre style="white-space:pre-wrap;background:#fee;padding:.5em">' . check_plain($original_text) . '</pre>'
-          . '<h4>' . t('Proposed') . '</h4><pre style="white-space:pre-wrap;background:#efe;padding:.5em">' . check_plain($proposed_text) . '</pre>',
+        '#markup' => '<h4>' . t('Original') . '</h4><pre style="white-space:pre-wrap;background:var(--gin-status-danger-bg,#fee);color:var(--gin-color-text,inherit);padding:.5em">' . check_plain($original_text) . '</pre>'
+          . '<h4>' . t('Proposed') . '</h4><pre style="white-space:pre-wrap;background:var(--gin-status-success-bg,#efe);color:var(--gin-color-text,inherit);padding:.5em">' . check_plain($proposed_text) . '</pre>',
       ];
     }
   }

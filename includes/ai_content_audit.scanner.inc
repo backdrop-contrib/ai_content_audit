@@ -4,10 +4,10 @@
  * @file
  * Scan orchestration and clustering for AI Content Audit.
  *
- * This is the heart of the audit scan: it inventories nodes, runs vector
- * similarity searches against the configured AI Search index, builds clusters
- * of semantically related nodes via union-find on the similarity edges, and
- * persists clusters + candidate rows for review.
+ * This is the heart of the audit scan: it inventories nodes and persists
+ * exact duplicate groups + candidate rows for review. Similarity and title
+ * overlap are deliberately not used to create audit clusters because related
+ * articles are not duplicates.
  *
  * Loaded on demand from the module file (hook_cron, hook_ai_async_callbacks,
  * and the admin "Scan Now" form). Scoring, LLM, and action-execution concerns
@@ -18,7 +18,7 @@
  *   - ai_content_audit_start_run()      — start an incremental scan run.
  *   - ai_content_audit_process_batch()  — process one batch of pending nids;
  *                                          triggers finalize when queue empties.
- *   - ai_content_audit_finalize_run()   — build clusters from edges, store,
+ *   - ai_content_audit_finalize_run()   — build exact duplicate groups, store,
  *                                          score, rank, then hand off to LLM
  *                                          summarize + auto-draft (in llm.inc).
  *   - ai_content_audit_active_run()     — currently collecting run, if any.
@@ -31,6 +31,8 @@
  *   - ai_content_audit.tools.inc   — AI agent tool definitions + implementations.
  *   - ai_content_audit.admin.inc   — dashboard, runs, clusters, queue, settings.
  */
+
+module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.fields');
 
 // ---------------------------------------------------------------------------
 // Run lifecycle
@@ -120,22 +122,21 @@ function ai_content_audit_process_batch($run_id, $batch_size = 50) {
 
   lock_release($lock_name);
 
-  // Process the claimed NIDs outside the lock (slow Search API calls).
+  // Collect pairwise similarity evidence for per-page ROT scoring. These edges
+  // are deliberately not converted into transitive clusters: related pages
+  // can share a topic without being duplicates. Exact-content groups are built
+  // during finalization from normalized fingerprints.
   $config = config('ai_content_audit.settings');
   $similarity_threshold = (float) ($config->get('similarity_threshold') ?: 0.75);
   $index_id = $config->get('search_api_index') ?: '';
-
-  // Load metadata for all nodes in scope (needed to check membership).
   $bundle_filter_mode = $config->get('bundle_filter_mode') ?: 'exclude';
   $filtered_bundles = array_keys(array_filter($config->get('excluded_bundles') ?: []));
   $all_nodes = ai_content_audit_inventory_nodes($filtered_bundles, $bundle_filter_mode);
 
   foreach ($batch as $nid) {
-    if (!isset($all_nodes[$nid])) {
-      continue;
+    if (isset($all_nodes[$nid])) {
+      _ai_content_audit_search_edges($run_id, $nid, $all_nodes[$nid], $all_nodes, $similarity_threshold, $index_id);
     }
-    $node = $all_nodes[$nid];
-    _ai_content_audit_search_edges($run_id, $nid, $node, $all_nodes, $similarity_threshold, $index_id);
   }
 
   $processed = (int) $run['processed_nodes'] + count($batch);
@@ -186,20 +187,29 @@ function ai_content_audit_finalize_run($run_id) {
   $config = config('ai_content_audit.settings');
   $profile = $run['profile'] ?: 'default';
 
-  // Build clusters from stored edges.
-  $clusters = _ai_content_audit_clusters_from_edges($run_id);
-
-  // Fallback: if no edges (Search API AI unavailable), use title overlap.
-  if (empty($clusters)) {
-    $bundle_filter_mode = $config->get('bundle_filter_mode') ?: 'exclude';
-    $filtered_bundles = array_keys(array_filter($config->get('excluded_bundles') ?: []));
-    $all_nodes = ai_content_audit_inventory_nodes($filtered_bundles, $bundle_filter_mode);
-    if (!empty($all_nodes)) {
-      $clusters = ai_content_audit_fallback_clusters($all_nodes);
-    }
-  }
+  // The audit result set is deliberately exact-only. Vector similarity and
+  // title overlap are useful discovery signals elsewhere, but they are not
+  // evidence that two pages are duplicates and must not create review items.
+  $bundle_filter_mode = $config->get('bundle_filter_mode') ?: 'exclude';
+  $filtered_bundles = array_keys(array_filter($config->get('excluded_bundles') ?: []));
+  $all_nodes = ai_content_audit_inventory_nodes($filtered_bundles, $bundle_filter_mode);
+  $clusters = ai_content_audit_build_exact_duplicate_clusters($all_nodes);
 
   $cluster_count = ai_content_audit_store_clusters($clusters, $run_id, $profile);
+
+  $duplicate_nids = [];
+  foreach ($clusters as $cluster) {
+    foreach ($cluster['nids'] as $nid) {
+      $duplicate_nids[(int) $nid] = TRUE;
+    }
+  }
+  $similarity_by_nid = ai_content_audit_get_node_similarity_scores(
+    $run_id,
+    array_keys($all_nodes),
+    array_keys($duplicate_nids)
+  );
+  ai_content_audit_ensure_node_score_table();
+  ai_content_audit_store_node_scores($run_id, $all_nodes, array_keys($duplicate_nids), $similarity_by_nid);
 
   ai_content_audit_score_traffic($run_id);
   ai_content_audit_rank_clusters($run_id);
@@ -251,6 +261,34 @@ function ai_content_audit_active_run() {
 // ---------------------------------------------------------------------------
 
 /**
+ * Build rich text search snippet for a node (title + body excerpt).
+ *
+ * Enriches the RAG query so vector embedding evaluates article content
+ * rather than superficial headline overlap.
+ *
+ * @param int $nid
+ *   The node ID.
+ * @param string $title
+ *   The node title.
+ * @param int $max_chars
+ *   Maximum characters for body excerpt (default 500).
+ *
+ * @return string
+ *   The search query string.
+ */
+function ai_content_audit_get_node_text_snippet($nid, $title, $max_chars = 500) {
+  $snippet = ai_content_audit_get_node_audit_text($nid);
+  if (mb_strlen($snippet) > $max_chars) {
+    $snippet = mb_substr($snippet, 0, $max_chars) . '...';
+  }
+
+  if ($snippet !== '') {
+    return $title . "\n\n" . $snippet;
+  }
+  return $title;
+}
+
+/**
  * Run similarity search for one node and write edges to ai_content_audit_edge.
  */
 function _ai_content_audit_search_edges($run_id, $nid, array $node, array $all_nodes, $threshold, $index_id) {
@@ -263,9 +301,10 @@ function _ai_content_audit_search_edges($run_id, $nid, array $node, array $all_n
   }
 
   $index_ids = $index_id ? [$index_id] : [];
+  $query = ai_content_audit_get_node_text_snippet($nid, $node['title']);
 
   $result = ai_search_execute_rag_search([
-    'query'           => $node['title'],
+    'query'           => $query,
     'index_ids'       => $index_ids,
     'top_k'           => 6,
     'score_threshold' => $threshold,
@@ -313,6 +352,44 @@ function _ai_content_audit_search_edges($run_id, $nid, array $node, array $all_n
       ])->execute();
     }
   }
+}
+
+/**
+ * Return the strongest similarity evidence for each scanned node.
+ *
+ * Exact duplicate members are assigned a score of 1.0. Semantic edges are
+ * used only as per-page evidence; they never create a transitive duplicate
+ * cluster or choose a canonical page.
+ */
+function ai_content_audit_get_node_similarity_scores($run_id, array $nids, array $duplicate_nids = []) {
+  $scores = array_fill_keys(array_map('intval', $nids), 0.0);
+
+  if (db_table_exists('ai_content_audit_edge') && !empty($nids)) {
+    $edges = db_query(
+      'SELECT nid_a, nid_b, score FROM {ai_content_audit_edge} WHERE run_id = :rid',
+      [':rid' => $run_id]
+    )->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($edges as $edge) {
+      $a = (int) $edge['nid_a'];
+      $b = (int) $edge['nid_b'];
+      $score = (float) $edge['score'];
+      if (isset($scores[$a])) {
+        $scores[$a] = max($scores[$a], $score);
+      }
+      if (isset($scores[$b])) {
+        $scores[$b] = max($scores[$b], $score);
+      }
+    }
+  }
+
+  foreach ($duplicate_nids as $nid) {
+    $nid = (int) $nid;
+    if (isset($scores[$nid])) {
+      $scores[$nid] = 1.0;
+    }
+  }
+
+  return $scores;
 }
 
 /**
@@ -473,7 +550,7 @@ function ai_content_audit_build_clusters(array $nodes, $threshold = 0.75, $index
   $index_ids = $index_id ? [$index_id] : [];
 
   foreach ($nodes as $nid => $node) {
-    $query = $node['title'];
+    $query = ai_content_audit_get_node_text_snippet($nid, $node['title']);
     $result = ai_search_execute_rag_search([
       'query'           => $query,
       'index_ids'       => $index_ids,
@@ -518,6 +595,7 @@ function ai_content_audit_fallback_clusters(array $nodes) {
     $words_a = ai_content_audit_title_words($node['title']);
     $group = [$nid];
     $assigned[$nid] = TRUE;
+    $similarities = [];
 
     foreach ($nodes as $other_nid => $other_node) {
       if ($other_nid === $nid || isset($assigned[$other_nid])) {
@@ -531,12 +609,54 @@ function ai_content_audit_fallback_clusters(array $nodes) {
       if ($jaccard >= 0.4) {
         $group[] = $other_nid;
         $assigned[$other_nid] = TRUE;
+        $similarities[] = $jaccard;
       }
     }
 
     if (count($group) > 1) {
-      $clusters[] = ['nids' => $group, 'similarity_score' => 0.5];
+      $avg_sim = !empty($similarities) ? (array_sum($similarities) / count($similarities)) : 0.5;
+      $clusters[] = [
+        'nids' => $group,
+        'similarity_score' => round($avg_sim, 4),
+      ];
     }
+  }
+
+  return $clusters;
+}
+
+/**
+ * Build duplicate groups from normalized full-content fingerprints.
+ *
+ * A content-audit cluster represents an exact duplicate set, not merely
+ * pages about the same subject. This keeps repeated template language,
+ * shared campaign terms, and related articles out of the action queue.
+ *
+ * @param array $nodes
+ *   Inventory rows keyed by node ID.
+ *
+ * @return array
+ *   Cluster arrays suitable for ai_content_audit_store_clusters().
+ */
+function ai_content_audit_build_exact_duplicate_clusters(array $nodes) {
+  $by_fingerprint = [];
+  foreach ($nodes as $nid => $node) {
+    $fingerprint = ai_content_audit_get_node_audit_fingerprint($nid);
+    if ($fingerprint === '') {
+      continue;
+    }
+    $by_fingerprint[$fingerprint][] = (int) $nid;
+  }
+
+  $clusters = [];
+  foreach ($by_fingerprint as $nids) {
+    if (count($nids) < 2) {
+      continue;
+    }
+    $clusters[] = [
+      'nids' => $nids,
+      'similarity_score' => 1.0,
+    ];
   }
 
   return $clusters;
@@ -620,8 +740,24 @@ function ai_content_audit_store_clusters(array $clusters, $run_id, $profile) {
     $sim_score = (float) $cluster_data['similarity_score'];
 
     $node_rows = ai_content_audit_load_node_rows($nids, $nodes_cache);
-    $canonical_nid = ai_content_audit_pick_canonical($node_rows);
-    $topic_label = !empty($node_rows[$canonical_nid]['title']) ? $node_rows[$canonical_nid]['title'] : 'Unknown cluster';
+    // Clustering identifies related pages. Only an all-exact-content cluster
+    // qualifies for the canonical/duplicate workflow; semantic similarity is
+    // never enough by itself.
+    $fingerprints = [];
+    foreach ($nids as $nid) {
+      $fingerprint = ai_content_audit_get_node_audit_fingerprint($nid);
+      if ($fingerprint === '') {
+        $fingerprints = [];
+        break;
+      }
+      $fingerprints[$nid] = $fingerprint;
+    }
+    $is_exact_duplicate_cluster = count($nids) > 1
+      && count($fingerprints) === count($nids)
+      && count(array_unique($fingerprints)) === 1;
+    $canonical_nid = $is_exact_duplicate_cluster ? ai_content_audit_pick_canonical($node_rows) : 0;
+    $topic_nid = reset($nids);
+    $topic_label = !empty($node_rows[$topic_nid]['title']) ? $node_rows[$topic_nid]['title'] : 'Related content cluster';
     $age_score = ai_content_audit_age_score($node_rows);
 
     $cid = db_insert('ai_content_audit_cluster')->fields([
@@ -635,14 +771,14 @@ function ai_content_audit_store_clusters(array $clusters, $run_id, $profile) {
       'age_score'          => $age_score,
       'composite_score'    => 0.0,
       'review_state'       => 'pending',
-      'rot_type'           => ai_content_audit_rot_classify($sim_score, $age_score),
-      'recommended_action' => ai_content_audit_recommend_action($sim_score, $age_score),
+      'rot_type'           => $is_exact_duplicate_cluster ? 'redundant' : 'review',
+      'recommended_action' => $is_exact_duplicate_cluster ? 'prune' : 'review',
       'created'            => REQUEST_TIME,
       'updated'            => REQUEST_TIME,
     ])->execute();
 
     foreach ($nids as $nid) {
-      $is_canonical = $nid === $canonical_nid ? 1 : 0;
+      $is_canonical = $canonical_nid && $nid === $canonical_nid ? 1 : 0;
       $title = !empty($node_rows[$nid]['title']) ? $node_rows[$nid]['title'] : '';
       $bundle = !empty($node_rows[$nid]['type']) ? $node_rows[$nid]['type'] : '';
 
@@ -654,7 +790,7 @@ function ai_content_audit_store_clusters(array $clusters, $run_id, $profile) {
         'title'          => substr($title, 0, 512),
         'similarity_score' => $sim_score,
         'is_canonical'   => $is_canonical,
-        'task_type'      => $is_canonical ? 'canonical' : 'duplicate_candidate',
+        'task_type'      => $is_canonical ? 'canonical' : ($is_exact_duplicate_cluster ? 'duplicate_candidate' : 'related'),
         'status'         => 'pending',
         'created'        => REQUEST_TIME,
         'updated'        => REQUEST_TIME,

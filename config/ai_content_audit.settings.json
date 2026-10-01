@@ -1,0 +1,21 @@
+{
+  "_config_name": "ai_content_audit.settings",
+  "cron_enabled": 1,
+  "cron_interval": 3600,
+  "cron_batch_size": 50,
+  "default_profile": "default",
+  "similarity_threshold": 0.75,
+  "search_api_index": "",
+  "bundle_filter_mode": "exclude",
+  "excluded_bundles": {},
+  "llm_summaries_enabled": 0,
+  "summary_model": "",
+  "auto_draft_edits_enabled": 0,
+  "auto_draft_edit_model": "",
+  "auto_draft_edit_limit": 5,
+  "weight_similarity": 50,
+  "weight_age": 30,
+  "weight_traffic": 20,
+  "decay_start_months": 6,
+  "stale_age_months": 24
+}

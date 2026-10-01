@@ -93,6 +93,7 @@ function ai_content_audit_apply_candidate(array $candidate) {
 
       case 'duplicate_candidate':
       case 'prune':
+      case 'retire':
         $node->status = 0;
         node_save($node);
         return TRUE;

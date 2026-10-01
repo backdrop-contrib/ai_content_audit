@@ -31,6 +31,69 @@ function ai_content_audit_normalize_text_for_compare($text) {
 }
 
 /**
+ * Collect the text used to measure and preview a node during an audit scan.
+ *
+ * This follows the same editable-field and paragraph discovery rules used by
+ * the draft editor. Some Backdrop sites store article copy in paragraph
+ * fields instead of the conventional node body field.
+ */
+function ai_content_audit_get_node_audit_text($nid) {
+  static $cache = [];
+
+  $nid = (int) $nid;
+  if (isset($cache[$nid])) {
+    return $cache[$nid];
+  }
+
+  $node = node_load($nid);
+  if (!$node) {
+    return $cache[$nid] = '';
+  }
+
+  $parts = [];
+  $fields = ai_content_audit_collect_editable_text_fields($node);
+  foreach ($fields as $field_name => $value) {
+    if (substr($field_name, -8) === '__format' || substr($field_name, -9) === '__summary') {
+      continue;
+    }
+    if (is_string($value) && trim($value) !== '') {
+      $parts[] = $value;
+    }
+  }
+
+  foreach (ai_content_audit_collect_paragraph_text_targets($node) as $target) {
+    if (!empty($target['value'])) {
+      $parts[] = $target['value'];
+    }
+  }
+
+  return $cache[$nid] = ai_content_audit_normalize_text_for_compare(implode("\n\n", $parts));
+}
+
+/**
+ * Return the normalized editable text length used by canonical selection.
+ */
+function ai_content_audit_get_node_audit_text_length($nid) {
+  return backdrop_strlen(ai_content_audit_get_node_audit_text($nid));
+}
+
+/**
+ * Return a strict content fingerprint for duplicate detection.
+ *
+ * Titles alone are never sufficient. An empty body produces no fingerprint so
+ * similarly titled pages cannot be promoted to exact duplicates by accident.
+ */
+function ai_content_audit_get_node_audit_fingerprint($nid) {
+  $node = node_load((int) $nid);
+  $text = ai_content_audit_get_node_audit_text($nid);
+  if (!$node || $text === '') {
+    return '';
+  }
+  $title = ai_content_audit_normalize_text_for_compare($node->title);
+  return hash('sha256', $title . "\n" . $text);
+}
+
+/**
  * Collect editable text fields from a node (or paragraph entity).
  *
  * Pass $entity_type 'paragraphs_item' for paragraph items — they carry their

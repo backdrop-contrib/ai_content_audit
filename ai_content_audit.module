@@ -2,13 +2,11 @@
 
 /**
  * @file
- * AI Content Audit — identify and act on redundant/outdated/trivial content.
+ * AI Content Audit — identify and act on exact duplicate content.
  *
- * Clusters semantically similar nodes via the AI Search vector index, scores
- * each cluster (similarity + age + traffic → composite), classifies via the
- * ROT framework (Redundant / Outdated / Trivial), and queues recommended
- * actions (prune, merge, flag, edit_proposed) for admin approval. No content
- * is mutated until an admin approves the proposed action.
+ * Clusters exact duplicate nodes, scores each cluster (age + traffic →
+ * composite), and queues recommended actions for admin approval. No content is
+ * mutated until an admin approves the proposed action.
  *
  * This file holds the small / always-loaded surface: hooks (permission, menu,
  * config, cron, ai_async callbacks, ai_tools), thin helper queries
@@ -70,13 +68,32 @@ function ai_content_audit_menu() {
   ];
 
   $items['admin/config/ai/content-audit/clusters'] = [
-    'title' => 'Clusters',
+    'title' => 'Duplicates',
     'page callback' => 'backdrop_get_form',
     'page arguments' => ['ai_content_audit_clusters_form'],
     'access arguments' => ['administer ai content audit'],
     'file' => 'includes/ai_content_audit.admin.inc',
     'type' => MENU_LOCAL_TASK,
     'weight' => 10,
+  ];
+
+  $items['admin/config/ai/content-audit/rot'] = [
+    'title' => 'ROT Scores',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_content_audit_rot_scores_form'],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 5,
+  ];
+
+  $items['admin/config/ai/content-audit/rot/%'] = [
+    'title' => 'ROT detail',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['ai_content_audit_rot_detail_form', 5],
+    'access arguments' => ['administer ai content audit'],
+    'file' => 'includes/ai_content_audit.admin.inc',
+    'type' => MENU_CALLBACK,
   ];
 
   $items['admin/config/ai/content-audit/clusters/%'] = [
@@ -130,6 +147,52 @@ function ai_content_audit_config_info() {
       'group' => t('AI'),
     ],
   ];
+}
+
+/**
+ * Return the schema for per-node ROT assessments.
+ */
+function ai_content_audit_node_score_schema() {
+  return [
+    'description' => 'Per-node ROT assessment from an audit run.',
+    'fields' => [
+      'sid' => ['type' => 'serial', 'not null' => TRUE],
+      'run_id' => ['type' => 'varchar', 'length' => 64, 'not null' => TRUE, 'default' => ''],
+      'nid' => ['type' => 'int', 'unsigned' => TRUE, 'not null' => TRUE, 'default' => 0],
+      'title' => ['type' => 'varchar', 'length' => 512, 'not null' => TRUE, 'default' => ''],
+      'bundle' => ['type' => 'varchar', 'length' => 128, 'not null' => TRUE, 'default' => ''],
+      'similarity_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'age_months' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'node_age_months' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'age_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'traffic_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'composite_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
+      'rot_type' => ['type' => 'varchar', 'length' => 32, 'not null' => TRUE, 'default' => 'review'],
+      'recommended_action' => ['type' => 'varchar', 'length' => 32, 'not null' => TRUE, 'default' => 'review'],
+      'review_state' => ['type' => 'varchar', 'length' => 16, 'not null' => TRUE, 'default' => 'pending'],
+      'created' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+      'updated' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
+    ],
+    'primary key' => ['sid'],
+    'indexes' => [
+      'run_id' => ['run_id'],
+      'nid' => ['nid'],
+      'similarity_score' => ['similarity_score'],
+      'age_months' => ['age_months'],
+      'node_age_months' => ['node_age_months'],
+      'rot_type' => ['rot_type'],
+      'composite_score' => ['composite_score'],
+    ],
+  ];
+}
+
+/**
+ * Ensure per-node ROT storage exists on upgraded local installations.
+ */
+function ai_content_audit_ensure_node_score_table() {
+  if (!db_table_exists('ai_content_audit_node_score')) {
+    db_create_table('ai_content_audit_node_score', ai_content_audit_node_score_schema());
+  }
 }
 
 /**
@@ -263,6 +326,31 @@ function ai_content_audit_run_id() {
 }
 
 /**
+ * Return the newest run whose cluster results are usable in the UI.
+ *
+ * Historical runs remain available from the Runs tab, but the default
+ * dashboard/list views must not mix their clusters with the current scan.
+ * A finalizing run is usable only after it has written at least one cluster.
+ * This also permits a completed scan with zero clusters to clear the list.
+ *
+ * @return string
+ *   Run ID, or an empty string when no usable run exists.
+ */
+function ai_content_audit_latest_cluster_run_id() {
+  return (string) db_query(
+    "SELECT r.run_id
+       FROM {ai_content_audit_run} r
+      WHERE r.status = 'complete'
+         OR (r.status = 'finalizing' AND EXISTS (
+              SELECT 1 FROM {ai_content_audit_cluster} c
+               WHERE c.run_id = r.run_id
+            ))
+      ORDER BY r.started DESC
+      LIMIT 1"
+  )->fetchField();
+}
+
+/**
  * Load a cluster record by cid.
  */
 function ai_content_audit_load_cluster($cid) {
@@ -274,6 +362,99 @@ function ai_content_audit_load_cluster($cid) {
  */
 function ai_content_audit_load_candidates($cluster_id) {
   return db_query('SELECT * FROM {ai_content_audit_candidate} WHERE cluster_id = :cid ORDER BY is_canonical DESC, similarity_score DESC', [':cid' => (int) $cluster_id])->fetchAllAssoc('acid', PDO::FETCH_ASSOC);
+}
+
+/**
+ * Queue an individual ROT page for editorial work.
+ *
+ * ROT assessments are not duplicate clusters, so their queue item uses the
+ * candidate table with cluster_id 0. The normal Action Queue can still show
+ * the item and link the editor directly to the node.
+ */
+function ai_content_audit_queue_rot_candidate(array $score, $task_type = 'edit_queued') {
+  if (!in_array($task_type, ['edit_queued', 'retire', 'prune', 'merge'], TRUE)) {
+    $task_type = 'edit_queued';
+  }
+  $status = in_array($task_type, ['retire', 'prune', 'merge'], TRUE) ? 'pending' : 'edit_queued';
+  $existing = db_query(
+    "SELECT acid FROM {ai_content_audit_candidate}
+      WHERE run_id = :run_id AND nid = :nid
+        AND status NOT IN (:statuses)
+      ORDER BY acid DESC LIMIT 1",
+    [
+      ':run_id' => $score['run_id'],
+      ':nid' => (int) $score['nid'],
+      ':statuses' => ['rejected', 'ignored', 'applied', 'failed'],
+    ]
+  )->fetchField();
+
+  if ($existing) {
+    db_update('ai_content_audit_candidate')->fields([
+      'task_type' => $task_type,
+      'status' => $status,
+      'updated' => REQUEST_TIME,
+    ])->condition('acid', (int) $existing)->execute();
+    return (int) $existing;
+  }
+
+  return (int) db_insert('ai_content_audit_candidate')->fields([
+    'cluster_id' => 0,
+    'run_id' => $score['run_id'],
+    'nid' => (int) $score['nid'],
+    'bundle' => $score['bundle'],
+    'title' => $score['title'],
+    'similarity_score' => isset($score['similarity_score']) ? (float) $score['similarity_score'] : 0.0,
+    'is_canonical' => 0,
+    'task_type' => $task_type,
+    'status' => $status,
+    'created' => REQUEST_TIME,
+    'updated' => REQUEST_TIME,
+  ])->execute();
+}
+
+/**
+ * Set one pending candidate as the working canonical page for a cluster.
+ *
+ * Canonical is an editable workflow choice, not an assertion that the page is
+ * factually authoritative. Do not switch it while a draft proposal exists.
+ */
+function ai_content_audit_set_canonical($cluster_id, $acid) {
+  $cluster_id = (int) $cluster_id;
+  $acid = (int) $acid;
+  $candidate = db_query(
+    'SELECT * FROM {ai_content_audit_candidate} WHERE acid = :acid AND cluster_id = :cid',
+    [':acid' => $acid, ':cid' => $cluster_id]
+  )->fetchAssoc();
+
+  if (!$candidate || $candidate['status'] !== 'pending' || !in_array($candidate['task_type'], ['canonical', 'duplicate_candidate', 'related'], TRUE)) {
+    return FALSE;
+  }
+
+  $proposal = db_query(
+    "SELECT COUNT(*) FROM {ai_content_audit_candidate}
+     WHERE cluster_id = :cid AND task_type = 'edit_proposed'
+       AND status IN ('pending', 'approved', 'applied')",
+    [':cid' => $cluster_id]
+  )->fetchField();
+  if ($proposal) {
+    return FALSE;
+  }
+
+  db_update('ai_content_audit_candidate')
+    ->fields(['is_canonical' => 0, 'task_type' => 'duplicate_candidate', 'updated' => REQUEST_TIME])
+    ->condition('cluster_id', $cluster_id)
+    ->condition('task_type', 'canonical')
+    ->execute();
+  db_update('ai_content_audit_candidate')
+    ->fields(['is_canonical' => 1, 'task_type' => 'canonical', 'updated' => REQUEST_TIME])
+    ->condition('acid', $acid)
+    ->execute();
+  db_update('ai_content_audit_cluster')
+    ->fields(['canonical_nid' => (int) $candidate['nid'], 'updated' => REQUEST_TIME])
+    ->condition('cid', $cluster_id)
+    ->execute();
+
+  return TRUE;
 }
 
 /**
@@ -467,10 +648,42 @@ function ai_content_audit_update_candidate_status(array $acids, $status, $uid = 
  * Get cluster counts by review state.
  */
 function ai_content_audit_cluster_counts() {
-  $result = db_query('SELECT review_state, COUNT(*) AS cnt FROM {ai_content_audit_cluster} GROUP BY review_state');
+  $run_id = ai_content_audit_latest_cluster_run_id();
+  if (!$run_id) {
+    return [];
+  }
+  $result = db_query(
+    'SELECT review_state, COUNT(*) AS cnt
+       FROM {ai_content_audit_cluster}
+      WHERE run_id = :run_id
+      GROUP BY review_state',
+    [':run_id' => $run_id]
+  );
   $counts = [];
   foreach ($result as $row) {
     $counts[$row->review_state] = (int) $row->cnt;
+  }
+  return $counts;
+}
+
+/**
+ * Get per-node ROT counts for the newest usable scan.
+ */
+function ai_content_audit_rot_counts() {
+  $run_id = ai_content_audit_latest_cluster_run_id();
+  if (!$run_id || !db_table_exists('ai_content_audit_node_score')) {
+    return [];
+  }
+  $result = db_query(
+    'SELECT rot_type, COUNT(*) AS cnt
+       FROM {ai_content_audit_node_score}
+      WHERE run_id = :run_id
+      GROUP BY rot_type',
+    [':run_id' => $run_id]
+  );
+  $counts = [];
+  foreach ($result as $row) {
+    $counts[$row->rot_type] = (int) $row->cnt;
   }
   return $counts;
 }
