@@ -697,6 +697,23 @@ function ai_content_audit_confirm_near_duplicates($run_id, array $nodes, array $
     }
   }
 
+  // Point every source at the end of its chain (A -> B -> C becomes A -> C)
+  // so no page is told to merge into a page that is itself being merged.
+  foreach (array_keys($merge_into) as $source) {
+    $target = $merge_into[$source];
+    $visited = [$source => TRUE];
+    while (isset($merge_into[$target]) && !isset($visited[$target])) {
+      $visited[$target] = TRUE;
+      $target = $merge_into[$target];
+    }
+    if ($target === $source || isset($visited[$target])) {
+      // A cycle; leave this page for human review.
+      unset($merge_into[$source]);
+      continue;
+    }
+    $merge_into[$source] = $target;
+  }
+
   return $merge_into;
 }
 

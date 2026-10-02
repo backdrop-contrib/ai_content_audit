@@ -213,6 +213,9 @@ function ai_content_audit_finalize_run($run_id) {
   $merge_into = [];
   if (module_exists('ai') && $config->get('near_duplicate_decision_model')) {
     module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.llm');
+    // One decision call per pair; a timeout here would strand the run in
+    // 'finalizing', so lift the limit for web-triggered batches.
+    backdrop_set_time_limit(0);
     $merge_into = ai_content_audit_confirm_near_duplicates($run_id, $all_nodes, array_keys($duplicate_nids));
   }
   ai_content_audit_ensure_node_score_table();
