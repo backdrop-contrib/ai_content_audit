@@ -575,6 +575,148 @@ function ai_content_audit_extract_edit_source_text(array $node_content) {
   return !empty($chunks) ? implode("\n\n", $chunks) : '';
 }
 
+// ---------------------------------------------------------------------------
+// Near-duplicate confirmation
+// ---------------------------------------------------------------------------
+
+/**
+ * Ask a decision model whether strongly similar page pairs are interchangeable.
+ *
+ * Only runs when near_duplicate_decision_model is configured. Pairs come from
+ * this run's similarity edges at or above the actionable threshold, most
+ * similar first, skipping exact duplicates (they have their own workflow).
+ * A failed call leaves that pair at review.
+ *
+ * @param string $run_id
+ *   The audit run ID; its edges must not have been deleted yet.
+ * @param array $nodes
+ *   Inventory rows keyed by nid.
+ * @param array $duplicate_nids
+ *   Exact-duplicate nids to skip.
+ *
+ * @return array
+ *   Confirmed merge sources keyed by nid, each mapped to the page it should
+ *   merge into (the pair's canonical page).
+ */
+function ai_content_audit_confirm_near_duplicates($run_id, array $nodes, array $duplicate_nids = []) {
+  $config = config('ai_content_audit.settings');
+  $model = (string) $config->get('near_duplicate_decision_model');
+  if ($model === '' || !module_exists('ai') || !db_table_exists('ai_content_audit_edge')) {
+    return [];
+  }
+
+  $stripped_model = '';
+  $api = ai_get_api_for_model($model, $stripped_model);
+  if (!$api || !method_exists($api, 'decide')) {
+    watchdog('ai_content_audit', 'Near-duplicate decision model @model is unavailable.', ['@model' => $model], WATCHDOG_WARNING);
+    return [];
+  }
+
+  $threshold = $config->get('near_duplicate_decision_threshold');
+  $threshold = is_numeric($threshold) ? (float) $threshold : 0.8;
+  $limit = max(1, (int) ($config->get('near_duplicate_decision_limit') ?: 25));
+  $skip = array_fill_keys(array_map('intval', $duplicate_nids), TRUE);
+
+  $edges = db_query(
+    'SELECT nid_a, nid_b, MAX(score) AS score FROM {ai_content_audit_edge}
+      WHERE run_id = :rid AND score >= :min
+      GROUP BY nid_a, nid_b
+      ORDER BY score DESC',
+    [':rid' => $run_id, ':min' => AI_CONTENT_AUDIT_ACTIONABLE_SIMILARITY_THRESHOLD]
+  )->fetchAll(PDO::FETCH_ASSOC);
+
+  $merge_into = [];
+  $seen = [];
+  $checked = 0;
+  foreach ($edges as $edge) {
+    if ($checked >= $limit) {
+      break;
+    }
+    $a = (int) $edge['nid_a'];
+    $b = (int) $edge['nid_b'];
+    $key = min($a, $b) . ':' . max($a, $b);
+    if ($a === $b || isset($seen[$key]) || isset($skip[$a]) || isset($skip[$b]) || !isset($nodes[$a], $nodes[$b])) {
+      continue;
+    }
+    $seen[$key] = TRUE;
+    // A page already confirmed as a merge source keeps its first (most
+    // similar) target.
+    if (isset($merge_into[$a]) && isset($merge_into[$b])) {
+      continue;
+    }
+    $checked++;
+
+    $input = "PAGE A\nTitle: " . $nodes[$a]['title'] . "\n" . ai_content_audit_trim_text(ai_content_audit_get_node_audit_text($a), 3000)
+      . "\n\nPAGE B\nTitle: " . $nodes[$b]['title'] . "\n" . ai_content_audit_trim_text(ai_content_audit_get_node_audit_text($b), 3000);
+    $question = [
+      'id' => 'interchangeable',
+      'type' => 'boolean',
+      // Asymmetric pairs (a long and a short version) count: asking whether
+      // nothing would be lost scored those low.
+      'prompt' => 'Do page A and page B cover the same specific subject for the same purpose, so that a site editor should merge them into one page instead of keeping both?',
+    ];
+
+    try {
+      $decisions = $api->decide($input, [$question], $stripped_model ?: $model, ['operation' => 'content_audit_near_duplicate']);
+    }
+    catch (\Throwable $e) {
+      watchdog('ai_content_audit', 'Near-duplicate decision for nodes @a and @b failed: @message', [
+        '@a' => $a,
+        '@b' => $b,
+        '@message' => $e->getMessage(),
+      ], WATCHDOG_WARNING);
+      continue;
+    }
+
+    $decision = NULL;
+    foreach ((array) $decisions as $d) {
+      if (is_array($d) && ($d['id'] ?? '') === 'interchangeable') {
+        $decision = $d;
+      }
+    }
+    if ($decision === NULL || !isset($decision['answer'])) {
+      continue;
+    }
+    if (isset($decision['probabilities']['true']) && is_numeric($decision['probabilities']['true'])) {
+      $p_true = (float) $decision['probabilities']['true'];
+    }
+    elseif (isset($decision['probability']) && is_numeric($decision['probability'])) {
+      $p_true = $decision['answer'] ? (float) $decision['probability'] : 1.0 - (float) $decision['probability'];
+    }
+    else {
+      $p_true = $decision['answer'] ? 1.0 : 0.0;
+    }
+    if ($p_true < $threshold) {
+      continue;
+    }
+
+    $canonical = ai_content_audit_pick_canonical([$a => $nodes[$a], $b => $nodes[$b]]);
+    $source = $canonical === $a ? $b : $a;
+    if (!isset($merge_into[$source])) {
+      $merge_into[$source] = $canonical;
+    }
+  }
+
+  // Point every source at the end of its chain (A -> B -> C becomes A -> C)
+  // so no page is told to merge into a page that is itself being merged.
+  foreach (array_keys($merge_into) as $source) {
+    $target = $merge_into[$source];
+    $visited = [$source => TRUE];
+    while (isset($merge_into[$target]) && !isset($visited[$target])) {
+      $visited[$target] = TRUE;
+      $target = $merge_into[$target];
+    }
+    if ($target === $source || isset($visited[$target])) {
+      // A cycle; leave this page for human review.
+      unset($merge_into[$source]);
+      continue;
+    }
+    $merge_into[$source] = $target;
+  }
+
+  return $merge_into;
+}
+
 /**
  * Trim text to a max length without dropping all context.
  */

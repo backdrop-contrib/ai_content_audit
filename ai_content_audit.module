@@ -169,6 +169,7 @@ function ai_content_audit_node_score_schema() {
       'composite_score' => ['type' => 'float', 'not null' => TRUE, 'default' => 0.0],
       'rot_type' => ['type' => 'varchar', 'length' => 32, 'not null' => TRUE, 'default' => 'review'],
       'recommended_action' => ['type' => 'varchar', 'length' => 32, 'not null' => TRUE, 'default' => 'review'],
+      'merge_into_nid' => ['type' => 'int', 'unsigned' => TRUE, 'not null' => TRUE, 'default' => 0, 'description' => 'Page a decision model confirmed this near-duplicate can merge into, or 0.'],
       'review_state' => ['type' => 'varchar', 'length' => 16, 'not null' => TRUE, 'default' => 'pending'],
       'created' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
       'updated' => ['type' => 'int', 'not null' => TRUE, 'default' => 0],
@@ -192,6 +193,10 @@ function ai_content_audit_node_score_schema() {
 function ai_content_audit_ensure_node_score_table() {
   if (!db_table_exists('ai_content_audit_node_score')) {
     db_create_table('ai_content_audit_node_score', ai_content_audit_node_score_schema());
+  }
+  elseif (!db_field_exists('ai_content_audit_node_score', 'merge_into_nid')) {
+    $schema = ai_content_audit_node_score_schema();
+    db_add_field('ai_content_audit_node_score', 'merge_into_nid', $schema['fields']['merge_into_nid']);
   }
 }
 

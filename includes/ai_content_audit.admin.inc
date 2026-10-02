@@ -470,6 +470,14 @@ function ai_content_audit_rot_detail_form($form, &$form_state, $sid) {
   }
 
   $node = node_load((int) $score['nid']);
+  $merge_target = '';
+  if (!empty($score['merge_into_nid'])) {
+    $target_nid = (int) $score['merge_into_nid'];
+    $target_title = db_query('SELECT title FROM {node} WHERE nid = :nid', [':nid' => $target_nid])->fetchField();
+    $merge_target = '<dt>' . t('Merge into') . '</dt><dd>'
+      . ($target_title !== FALSE ? l($target_title, 'node/' . $target_nid, ['attributes' => ['target' => '_blank']]) : t('Node @nid no longer exists.', ['@nid' => $target_nid]))
+      . ' <em>(' . t('confirmed interchangeable by a decision model') . ')</em></dd>';
+  }
   $form['summary'] = [
     '#markup' => '<h2>' . check_plain($score['title']) . '</h2>'
       . '<p>' . l(t('View published node'), 'node/' . (int) $score['nid'], ['attributes' => ['target' => '_blank']])
@@ -483,6 +491,7 @@ function ai_content_audit_rot_detail_form($form, &$form_state, $sid) {
       . '<dt>' . t('Traffic score') . '</dt><dd>' . round($score['traffic_score'], 3) . '</dd>'
       . '<dt>' . t('ROT priority') . '</dt><dd>' . round($score['composite_score'], 3) . '</dd>'
       . '<dt>' . t('Recommendation') . '</dt><dd>' . check_plain($score['recommended_action']) . '</dd>'
+      . $merge_target
       . '<dt>' . t('Status') . '</dt><dd>' . check_plain($score['review_state']) . '</dd>'
       . '</dl>',
   ];
@@ -1391,6 +1400,44 @@ function ai_content_audit_settings_form($form, &$form_state) {
     ],
   ];
 
+  $form['near_duplicates'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Near-duplicate confirmation'),
+    '#description' => t('Semantic similarity alone keeps near-duplicate pages at "review". Optionally ask a decision model whether each strongly similar pair is actually interchangeable; confirmed pairs recommend merging the weaker page into the stronger one. Merges remain approval-gated.'),
+  ];
+  $decision_models = function_exists('ai_get_all_decision_models') ? (ai_get_all_decision_models() ?: []) : [];
+  $form['near_duplicates']['near_duplicate_decision_model'] = [
+    '#type' => 'select',
+    '#title' => t('Decision model'),
+    '#options' => ['' => t('- None (keep near-duplicates at review) -')] + $decision_models,
+    '#default_value' => (string) $config->get('near_duplicate_decision_model'),
+  ];
+  $nd_threshold = $config->get('near_duplicate_decision_threshold');
+  $form['near_duplicates']['near_duplicate_decision_threshold'] = [
+    '#type' => 'textfield',
+    '#title' => t('Confirmation threshold'),
+    '#description' => t('Probability (0-1) that the pages are interchangeable before a merge is recommended. Default is 0.8.'),
+    '#default_value' => is_numeric($nd_threshold) ? $nd_threshold : 0.8,
+    '#size' => 10,
+    '#states' => [
+      'invisible' => [
+        ':input[name="near_duplicate_decision_model"]' => ['value' => ''],
+      ],
+    ],
+  ];
+  $form['near_duplicates']['near_duplicate_decision_limit'] = [
+    '#type' => 'select',
+    '#title' => t('Pairs checked per scan'),
+    '#description' => t('The most similar pairs are checked first.'),
+    '#options' => [10 => 10, 25 => 25, 50 => 50, 100 => 100],
+    '#default_value' => $config->get('near_duplicate_decision_limit') ?: 25,
+    '#states' => [
+      'invisible' => [
+        ':input[name="near_duplicate_decision_model"]' => ['value' => ''],
+      ],
+    ],
+  ];
+
   $form['scoring'] = [
     '#type' => 'fieldset',
     '#title' => t('Scoring &amp; Consolidation Priority'),
@@ -1468,6 +1515,14 @@ function ai_content_audit_settings_form_validate($form, &$form_state) {
   $stale_age = isset($form_state['values']['stale_age_months']) ? (int) $form_state['values']['stale_age_months'] : 24;
   if ($decay_start >= $stale_age) {
     form_set_error('decay_start_months', t('Decay start threshold must be strictly less than the full staleness threshold.'));
+  }
+
+  $nd_threshold = $form_state['values']['near_duplicate_decision_threshold'] ?? 0.8;
+  if (!is_numeric($nd_threshold) || $nd_threshold < 0 || $nd_threshold > 1) {
+    form_set_error('near_duplicate_decision_threshold', t('The confirmation threshold must be a number between 0 and 1.'));
+  }
+  else {
+    form_set_value($form['near_duplicates']['near_duplicate_decision_threshold'], (float) $nd_threshold, $form_state);
   }
 }
 

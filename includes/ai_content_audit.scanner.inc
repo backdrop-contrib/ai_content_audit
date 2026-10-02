@@ -208,8 +208,18 @@ function ai_content_audit_finalize_run($run_id) {
     array_keys($all_nodes),
     array_keys($duplicate_nids)
   );
+  // Optional decision-model confirmation of near-duplicate pairs; reads this
+  // run's edges, so it must run before they are deleted below.
+  $merge_into = [];
+  if (module_exists('ai') && $config->get('near_duplicate_decision_model')) {
+    module_load_include('inc', 'ai_content_audit', 'includes/ai_content_audit.llm');
+    // One decision call per pair; a timeout here would strand the run in
+    // 'finalizing', so lift the limit for web-triggered batches.
+    backdrop_set_time_limit(0);
+    $merge_into = ai_content_audit_confirm_near_duplicates($run_id, $all_nodes, array_keys($duplicate_nids));
+  }
   ai_content_audit_ensure_node_score_table();
-  ai_content_audit_store_node_scores($run_id, $all_nodes, array_keys($duplicate_nids), $similarity_by_nid);
+  ai_content_audit_store_node_scores($run_id, $all_nodes, array_keys($duplicate_nids), $similarity_by_nid, $merge_into);
 
   ai_content_audit_score_traffic($run_id);
   ai_content_audit_rank_clusters($run_id);
