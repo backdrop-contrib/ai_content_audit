@@ -208,6 +208,33 @@ function ai_content_audit_update_1008() {
 }
 
 /**
+ * Add decision-confirmed merge targets and near-duplicate settings.
+ */
+function ai_content_audit_update_1009() {
+  if (db_table_exists('ai_content_audit_node_score') && !db_field_exists('ai_content_audit_node_score', 'merge_into_nid')) {
+    db_add_field('ai_content_audit_node_score', 'merge_into_nid', [
+      'type' => 'int',
+      'unsigned' => TRUE,
+      'not null' => TRUE,
+      'default' => 0,
+      'description' => 'Page a decision model confirmed this near-duplicate can merge into, or 0.',
+    ]);
+  }
+  $config = config('ai_content_audit.settings');
+  $defaults = [
+    'near_duplicate_decision_model' => '',
+    'near_duplicate_decision_threshold' => 0.8,
+    'near_duplicate_decision_limit' => 25,
+  ];
+  foreach ($defaults as $key => $value) {
+    if ($config->get($key) === NULL) {
+      $config->set($key, $value);
+    }
+  }
+  $config->save();
+}
+
+/**
  * Create content audit storage tables.
  */
 function ai_content_audit_update_1000() {

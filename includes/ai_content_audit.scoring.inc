@@ -535,8 +535,10 @@ function ai_content_audit_get_priority_weights($has_traffic = NULL) {
  * Exact duplicate membership and semantic similarity are supplied separately
  * from the per-node ROT signals. Similarity can identify redundant pages for
  * review, but only exact fingerprints create the separate duplicate workflow.
+ * $merge_into maps near-duplicate nids a decision model confirmed as
+ * interchangeable to the page they should merge into.
  */
-function ai_content_audit_store_node_scores($run_id, array $nodes, array $duplicate_nids = [], array $similarity_by_nid = []) {
+function ai_content_audit_store_node_scores($run_id, array $nodes, array $duplicate_nids = [], array $similarity_by_nid = [], array $merge_into = []) {
   if (empty($nodes)) {
     return 0;
   }
@@ -579,7 +581,8 @@ function ai_content_audit_store_node_scores($run_id, array $nodes, array $duplic
       $similarity_score,
       $age_score,
       $node_age_months,
-      $traffic_score
+      $traffic_score,
+      (int) ($merge_into[$nid] ?? 0)
     );
 
     db_insert('ai_content_audit_node_score')->fields([
@@ -595,6 +598,7 @@ function ai_content_audit_store_node_scores($run_id, array $nodes, array $duplic
       'composite_score' => $composite,
       'rot_type' => $rot_type,
       'recommended_action' => $recommended_action,
+      'merge_into_nid' => $recommended_action === 'merge' ? (int) ($merge_into[$nid] ?? 0) : 0,
       'review_state' => 'pending',
       'created' => REQUEST_TIME,
       'updated' => REQUEST_TIME,
@@ -635,17 +639,19 @@ function ai_content_audit_node_rot_classify($similarity_score, $age_score, $cont
  * full staleness threshold and has very low traffic receives it. It is a
  * recommendation, not an automatic unpublish action.
  */
-function ai_content_audit_node_recommend_action($rot_type, $is_duplicate, $similarity_score, $age_score, $node_age_months = 0.0, $traffic_score = 0.0) {
+function ai_content_audit_node_recommend_action($rot_type, $is_duplicate, $similarity_score, $age_score, $node_age_months = 0.0, $traffic_score = 0.0, $merge_into_nid = 0) {
   switch ($rot_type) {
     case 'redundant':
     case 'redundant_outdated':
       // Semantic similarity can classify a page as redundant, but only an
       // exact fingerprint belongs to the consolidation workflow. Keep
-      // near-duplicate recommendations human-reviewed until an editor
-      // confirms that the pages are actually interchangeable.
-      return $is_duplicate
-        ? ($similarity_score >= AI_CONTENT_AUDIT_PRUNE_SIMILARITY_THRESHOLD ? 'prune' : 'merge')
-        : 'review';
+      // near-duplicate recommendations human-reviewed unless a decision
+      // model confirmed the pages are interchangeable; then only the weaker
+      // page of the pair (the one with a merge target) is recommended to merge.
+      if ($is_duplicate) {
+        return $similarity_score >= AI_CONTENT_AUDIT_PRUNE_SIMILARITY_THRESHOLD ? 'prune' : 'merge';
+      }
+      return $merge_into_nid > 0 ? 'merge' : 'review';
     case 'outdated':
       if ((float) $age_score >= 1.0
         && (float) $node_age_months >= AI_CONTENT_AUDIT_RETIRE_MIN_NODE_AGE_MONTHS
