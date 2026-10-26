@@ -1347,24 +1347,13 @@ function ai_content_audit_settings_form($form, &$form_state) {
   ];
 
   $chat_models = function_exists('ai_get_all_chat_models') ? ai_get_all_chat_models() : [];
-  $saved_model = $config->get('summary_model') ?: '';
-  $default_model = function_exists('ai_default_model')
-    ? ai_default_model($chat_models, $saved_model, ['openai/gpt-4o-mini', 'openai/gpt-4o'])
-    : $saved_model;
-
   $form['llm']['summary_model'] = [
     '#type' => 'select',
     '#title' => t('Summary model'),
     '#description' => t('Model used to generate 2-sentence cluster summaries. Only chat models from enabled providers are listed.'),
-    '#options' => ['' => t('— Select a model —')] + $chat_models,
-    '#default_value' => $default_model,
-    '#empty_option' => t('— Select a model —'),
+    '#options' => ai_model_options_with_default($chat_models, 'chat'),
+    '#default_value' => (string) $config->get('summary_model'),
   ];
-
-  $saved_edit_model = $config->get('auto_draft_edit_model') ?: '';
-  $default_edit_model = function_exists('ai_default_model')
-    ? ai_default_model($chat_models, $saved_edit_model, [$default_model, 'openai/gpt-4o-mini', 'openai/gpt-4o'])
-    : $saved_edit_model;
 
   $form['llm']['auto_draft_edits_enabled'] = [
     '#type' => 'checkbox',
@@ -1377,9 +1366,8 @@ function ai_content_audit_settings_form($form, &$form_state) {
     '#type' => 'select',
     '#title' => t('Draft edit model'),
     '#description' => t('Model used to generate draft revisions for canonical pages.'),
-    '#options' => ['' => t('— Select a model —')] + $chat_models,
-    '#default_value' => $default_edit_model,
-    '#empty_option' => t('— Select a model —'),
+    '#options' => ai_model_options_with_default($chat_models, 'chat'),
+    '#default_value' => (string) $config->get('auto_draft_edit_model'),
     '#states' => [
       'visible' => [
         ':input[name="auto_draft_edits_enabled"]' => ['checked' => TRUE],
