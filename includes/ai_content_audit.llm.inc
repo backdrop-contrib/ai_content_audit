@@ -115,7 +115,7 @@ function ai_content_audit_llm_summarize($prompt) {
     return '';
   }
   $config = config('ai_content_audit.settings');
-  $model = $config->get('summary_model') ?: '';
+  $model = ai_resolve_model($config->get('summary_model'), 'chat');
   if ($model === '') {
     return '';
   }
@@ -502,7 +502,7 @@ function ai_content_audit_llm_generate_edit($prompt) {
   }
 
   $config = config('ai_content_audit.settings');
-  $model = $config->get('auto_draft_edit_model') ?: '';
+  $model = ai_resolve_model($config->get('auto_draft_edit_model'), 'chat');
   if ($model === '') {
     return [];
   }
