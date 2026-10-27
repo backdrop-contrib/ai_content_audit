@@ -44,6 +44,7 @@ content is changed until a site administrator approves each proposed action.
 ## Requirements
 
 - Backdrop CMS 1.x
+- PHP 8.2 or later
 - [AI module](https://github.com/backdrop-contrib/ai) with at least one
   configured text provider
 - AI Search is not required for exact duplicate detection. It may still be
@@ -158,7 +159,7 @@ for approval in the queue — the agent cannot apply changes directly.
 ## Issues
 
 Bugs and feature requests should be reported in the
-[Issue Queue](https://github.com/backdrop-contrib/ai-content-audit/issues).
+[Issue Queue](https://github.com/backdrop-contrib/ai_content_audit/issues).
 
 ## Current Maintainer
 
